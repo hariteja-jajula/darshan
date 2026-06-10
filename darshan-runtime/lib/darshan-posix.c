@@ -150,7 +150,7 @@ struct posix_file_record_ref
     int stride_count;
     struct posix_aio_tracker* aio_list;
     int fs_type; /* same as darshan_fs_info->fs_type */
-#ifdef HAVE_LDMS
+#if defined(HAVE_LDMS) || defined(HAVE_MOFKA)
     int64_t close_counts;
 #endif
 };
@@ -352,6 +352,10 @@ static int darshan_mem_alignment = 1;
     if(dC.ldms_lib)\
         if(dC.posix_enable_ldms)\
             darshan_ldms_connector_send(rec_ref->file_rec->base_rec.id, rec_ref->file_rec->base_rec.rank, rec_ref->file_rec->counters[POSIX_READS], "read", this_offset, __ret, rec_ref->file_rec->counters[POSIX_MAX_BYTE_READ],rec_ref->file_rec->counters[POSIX_RW_SWITCHES], -1,  __tm1, __tm2, rec_ref->file_rec->fcounters[POSIX_F_READ_TIME], "POSIX", "MOD");\
+    /* Mofka: parallel sink to LDMS, independent enable */ \
+    if(mC.mofka_lib)\
+        if(mC.posix_enable_mofka)\
+            darshan_mofka_connector_send(rec_ref->file_rec->base_rec.id, rec_ref->file_rec->base_rec.rank, rec_ref->file_rec->counters[POSIX_READS], "read", this_offset, __ret, rec_ref->file_rec->counters[POSIX_MAX_BYTE_READ],rec_ref->file_rec->counters[POSIX_RW_SWITCHES], -1,  __tm1, __tm2, rec_ref->file_rec->fcounters[POSIX_F_READ_TIME], "POSIX", "MOD");\
 } while(0)
 
 #define POSIX_RECORD_WRITE(__ret, __fd, __pwrite_flag, __pwrite_offset, __aligned, __tm1, __tm2) do { \
@@ -421,6 +425,10 @@ static int darshan_mem_alignment = 1;
     if(dC.ldms_lib)\
         if(dC.posix_enable_ldms)\
             darshan_ldms_connector_send(rec_ref->file_rec->base_rec.id, rec_ref->file_rec->base_rec.rank, rec_ref->file_rec->counters[POSIX_WRITES], "write", this_offset, __ret, rec_ref->file_rec->counters[POSIX_MAX_BYTE_WRITTEN], rec_ref->file_rec->counters[POSIX_RW_SWITCHES], -1, __tm1, __tm2, rec_ref->file_rec->fcounters[POSIX_F_WRITE_TIME], "POSIX", "MOD");\
+    /* Mofka: parallel sink to LDMS, independent enable */ \
+    if(mC.mofka_lib)\
+        if(mC.posix_enable_mofka)\
+            darshan_mofka_connector_send(rec_ref->file_rec->base_rec.id, rec_ref->file_rec->base_rec.rank, rec_ref->file_rec->counters[POSIX_WRITES], "write", this_offset, __ret, rec_ref->file_rec->counters[POSIX_MAX_BYTE_WRITTEN], rec_ref->file_rec->counters[POSIX_RW_SWITCHES], -1, __tm1, __tm2, rec_ref->file_rec->fcounters[POSIX_F_WRITE_TIME], "POSIX", "MOD");\
 } while(0)
 
 #define POSIX_LOOKUP_RECORD_STAT(__path, __statbuf, __tm1, __tm2) do { \
@@ -1758,12 +1766,24 @@ int DARSHAN_DECL(close)(int fd)
             tm1, tm2, rec_ref->last_meta_end);
         darshan_delete_record_ref(&(posix_runtime->fd_hash), &fd, sizeof(int));
 
-#ifdef HAVE_LDMS
+#if defined(HAVE_LDMS) || defined(HAVE_MOFKA)
+        /* close_counts is needed by both runtime streaming sinks, so
+         * increment it whenever either backend is compiled in. The
+         * close_counts struct field is declared under the matching
+         * #if at line ~153. */
         rec_ref->close_counts++;
         /* publish close information for posix */
+#ifdef HAVE_LDMS
         if(dC.ldms_lib)
             if(dC.posix_enable_ldms)
                 darshan_ldms_connector_send(rec_ref->file_rec->base_rec.id, rec_ref->file_rec->base_rec.rank, rec_ref->close_counts, "close", -1, -1, -1, -1, -1, tm1, tm2, rec_ref->file_rec->fcounters[POSIX_F_META_TIME], "POSIX", "MOD");
+#endif
+#ifdef HAVE_MOFKA
+        /* Mofka: parallel sink to LDMS, independent enable */
+        if(mC.mofka_lib)
+            if(mC.posix_enable_mofka)
+                darshan_mofka_connector_send(rec_ref->file_rec->base_rec.id, rec_ref->file_rec->base_rec.rank, rec_ref->close_counts, "close", -1, -1, -1, -1, -1, tm1, tm2, rec_ref->file_rec->fcounters[POSIX_F_META_TIME], "POSIX", "MOD");
+#endif
 #endif
     }
     POSIX_POST_RECORD();
