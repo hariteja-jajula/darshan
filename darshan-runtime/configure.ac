@@ -643,16 +643,19 @@ if test "x$enable_darshan_runtime" = xyes ; then
 
    if test "x$enable_mofka_mod" = xyes ; then
       # locate mofka via pkg-config; --with-mofka can prepend to PKG_CONFIG_PATH
+      # (also include share/pkgconfig: nlohmann_json.pc typically lives there)
       if test "x$with_mofka" != x && test "x$with_mofka" != xyes ; then
          if test -d "$with_mofka/lib/pkgconfig" ; then
             PKG_CONFIG_PATH="$with_mofka/lib/pkgconfig:$PKG_CONFIG_PATH"
-            export PKG_CONFIG_PATH
          elif test -d "$with_mofka/lib64/pkgconfig" ; then
             PKG_CONFIG_PATH="$with_mofka/lib64/pkgconfig:$PKG_CONFIG_PATH"
-            export PKG_CONFIG_PATH
          else
             AC_MSG_ERROR([Mofka installation path, $with_mofka, has no lib/pkgconfig or lib64/pkgconfig directory])
          fi
+         if test -d "$with_mofka/share/pkgconfig" ; then
+            PKG_CONFIG_PATH="$with_mofka/share/pkgconfig:$PKG_CONFIG_PATH"
+         fi
+         export PKG_CONFIG_PATH
       fi
 
       CHECK_MOFKA

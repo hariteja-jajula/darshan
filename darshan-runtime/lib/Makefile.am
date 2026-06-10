@@ -118,6 +118,10 @@ endif
 if HAVE_MOFKA
 libdarshan_la_LIBADD   += $(MOFKA_LIBS)
 libdarshan_la_CPPFLAGS += $(MOFKA_CFLAGS)
+# Mofka headers use C++17 features (std::string_view, etc.); apply
+# the standard flag only to the C++ translation unit so the existing
+# C sources are unaffected.
+libdarshan_la_CXXFLAGS = $(AM_CXXFLAGS) -std=c++17
 endif
 
 H_SRCS = darshan-common.h \
