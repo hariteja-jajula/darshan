@@ -36,6 +36,7 @@
 #include "darshan-dxt.h"
 #include "darshan-heatmap.h"
 #include "darshan-ldms.h"
+#include "darshan-mofka.h"
 
 #ifndef HAVE_OFF64_T
 typedef int64_t off64_t;
@@ -255,6 +256,10 @@ static int darshan_mem_alignment = 1;
     if(dC.ldms_lib)\
         if(dC.posix_enable_ldms)\
             darshan_ldms_connector_send(__rec_ref->file_rec->base_rec.id, __rec_ref->file_rec->base_rec.rank, __rec_ref->file_rec->counters[POSIX_OPENS], "open", -1, -1, -1, -1, -1, __tm1, __tm2, __rec_ref->file_rec->fcounters[POSIX_F_META_TIME], "POSIX", "MET");\
+    /* Mofka: parallel sink to LDMS, independent enable */ \
+    if(mC.mofka_lib)\
+        if(mC.posix_enable_mofka)\
+            darshan_mofka_connector_send(__rec_ref->file_rec->base_rec.id, __rec_ref->file_rec->base_rec.rank, __rec_ref->file_rec->counters[POSIX_OPENS], "open", -1, -1, -1, -1, -1, __tm1, __tm2, __rec_ref->file_rec->fcounters[POSIX_F_META_TIME], "POSIX", "MET");\
 } while(0)
 
 #define POSIX_RECORD_REFOPEN(__ret, __rec_ref, __tm1, __tm2, __ref_counter) do { \
