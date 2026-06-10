@@ -18,8 +18,14 @@ C_SRCS = darshan-core-init-finalize.c \
          darshan-common.c \
          darshan-config.c \
          darshan-ldms.c \
+         darshan-mofka.c \
          lookup3.c \
          lookup8.c
+
+CXX_SRCS =
+if HAVE_MOFKA
+   CXX_SRCS += darshan-mofka-impl.cpp
+endif
 
 if BUILD_NULL_MODULE
    C_SRCS += darshan-null.c
@@ -96,11 +102,11 @@ endif
 darshan-apmpi.c:
 	$(LN_S) $(apmpi_root)/lib/darshan-apmpi.c .
 
-libdarshan_la_SOURCES  = $(C_SRCS)
+libdarshan_la_SOURCES  = $(C_SRCS) $(CXX_SRCS)
 libdarshan_la_LIBADD   = -lpthread -lrt -lz -ldl $(DARSHAN_LUSTRE_LD_FLAGS)
 libdarshan_la_CPPFLAGS = $(AM_CPPFLAGS) -D_LARGEFILE64_SOURCE -DDARSHAN_PRELOAD
 
-libdarshan_a_SOURCES   = $(C_SRCS)
+libdarshan_a_SOURCES   = $(C_SRCS) $(CXX_SRCS)
 libdarshan_a_CPPFLAGS  = $(AM_CPPFLAGS) -D_LARGEFILE64_SOURCE -DDARSHAN_WRAP_MMAP
 
 if HAVE_LDMS
@@ -109,11 +115,17 @@ libdarshan_la_CPPFLAGS += -I$(LDMS_HOME)/include
 libdarshan_la_LDFLAGS = -L$(LDMS_HOME)/lib -Wl,-rpath=$(LDMS_HOME)/lib
 endif
 
+if HAVE_MOFKA
+libdarshan_la_LIBADD   += $(MOFKA_LIBS)
+libdarshan_la_CPPFLAGS += $(MOFKA_CFLAGS)
+endif
+
 H_SRCS = darshan-common.h \
          darshan.h \
          darshan-config.h \
          darshan-dxt.h \
          darshan-ldms.h \
+         darshan-mofka.h \
          uthash.h \
          darshan-dynamic.h \
          utlist.h \
@@ -125,6 +137,8 @@ EXTRA_DIST = $(H_SRCS) \
              darshan-stdio.c \
              darshan-dxt.c \
              darshan-ldms.c \
+             darshan-mofka.c \
+             darshan-mofka-impl.cpp \
              darshan-mpiio.c \
              darshan-pnetcdf.c \
              darshan-pnetcdf-api.m4 \

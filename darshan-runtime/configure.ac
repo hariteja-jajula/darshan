@@ -613,6 +613,51 @@ if test "x$enable_darshan_runtime" = xyes ; then
       CHECK_LDMS
    fi
 
+   # inform about Mofka installs not found in default locations
+   AC_ARG_WITH([mofka],
+      [AS_HELP_STRING([--with-mofka@<:@=DIR@:>@],
+                      [Installation directory for Mofka client library.])]
+   )
+
+   # Mofka support (disabled by default)
+   AC_ARG_ENABLE([mofka-mod],
+      [AS_HELP_STRING([--enable-mofka-mod],
+                      [Include Mofka for runtime I/O record streaming])]
+   )
+
+   # When --with-mofka is set, automatically enable enable_mofka_mod
+   if test "x$enable_mofka_mod" = x ; then
+      if test "x$with_mofka" != x ; then
+         enable_mofka_mod=yes
+      else
+         enable_mofka_mod=no
+      fi
+   fi
+
+   # AC_PROG_CXX must be called unconditionally (Automake requirement: the
+   # am__fastdepCXX conditional must be defined at config time even when we
+   # don't end up compiling any C++. Mofka is the only C++ user today; if
+   # --with-mofka is not given, this just probes for a C++ compiler and
+   # never uses it.)
+   AC_PROG_CXX
+
+   if test "x$enable_mofka_mod" = xyes ; then
+      # locate mofka via pkg-config; --with-mofka can prepend to PKG_CONFIG_PATH
+      if test "x$with_mofka" != x && test "x$with_mofka" != xyes ; then
+         if test -d "$with_mofka/lib/pkgconfig" ; then
+            PKG_CONFIG_PATH="$with_mofka/lib/pkgconfig:$PKG_CONFIG_PATH"
+            export PKG_CONFIG_PATH
+         elif test -d "$with_mofka/lib64/pkgconfig" ; then
+            PKG_CONFIG_PATH="$with_mofka/lib64/pkgconfig:$PKG_CONFIG_PATH"
+            export PKG_CONFIG_PATH
+         else
+            AC_MSG_ERROR([Mofka installation path, $with_mofka, has no lib/pkgconfig or lib64/pkgconfig directory])
+         fi
+      fi
+
+      CHECK_MOFKA
+   fi
+
    dnl sanity check some config parameters
    if test "x$GOT_LOG_PATH" != xyes ; then
       AC_MSG_ERROR(must provide --with-log-path=<path> _or_ --with-log-path-by-env=<variable list> argument to configure.)
@@ -939,6 +984,7 @@ else
    enable_lustre_mod=no
    enable_mdhim_mod=no
    enable_ldms_mod=no
+   enable_mofka_mod=no
    with_log_path=
    with_jobid_env=
    have_mpi_io_large_count_apis=no
@@ -968,6 +1014,7 @@ AC_SUBST(ENABLE_BGQ_MOD, ["$enable_bgq_mod"])
 AC_SUBST(ENABLE_LUSTRE_MOD, ["$enable_lustre_mod"])
 AC_SUBST(ENABLE_MDHIM_MOD, ["$enable_mdhim_mod"])
 AC_SUBST(ENABLE_LDMS_MOD, ["$enable_ldms_mod"])
+AC_SUBST(ENABLE_MOFKA_MOD, ["$enable_mofka_mod"])
 AC_SUBST(ENABLE_RDTSCP_NUM, ["$rdtscp_num"])
 AC_SUBST(ENABLE_EXIT_WRAPPER, ["$enable_exit_wrapper"])
 AC_SUBST(ZLIB_HOME, ["$ZLIB_HOME"])
@@ -981,6 +1028,7 @@ AC_SUBST(HDF5_PATH, ["$with_hdf5"])
 AC_SUBST(PNETCDF_PATH, ["$with_pnetcdf"])
 AC_SUBST(DAOS_PATH, ["$with_daos"])
 AC_SUBST(LDMS_PATH, ["$LDMS_HOME"])
+AC_SUBST(MOFKA_PATH, ["$with_mofka"])
 AC_SUBST(HAVE_OPEN_MPI, ["$is_ompi"])
 AC_SUBST(OMPI_GE_5_0_6, ["$ompi_ge_5_0_6"])
 
@@ -1001,6 +1049,7 @@ AM_CONDITIONAL(BUILD_APMPI_MODULE,  [test "x$enable_apmpi_mod"   = xyes])
 AM_CONDITIONAL(BUILD_HEATMAP_MODULE,[test "x$enable_heatmap_mod" = xyes])
 AM_CONDITIONAL(BUILD_DAOS_MODULE,   [test "x$enable_daos_mod"    = xyes])
 AM_CONDITIONAL(HAVE_LDMS,           [test "x$enable_ldms_mod"    = xyes])
+AM_CONDITIONAL(HAVE_MOFKA,          [test "x$enable_mofka_mod"   = xyes])
 
 AC_CONFIG_FILES(Makefile \
                 darshan-config \
@@ -1079,6 +1128,7 @@ if test "x$enable_darshan_runtime" = xyes ; then
            MDHIM         module support  - $enable_mdhim_mod
            HEATMAP       module support  - $enable_heatmap_mod
            LDMS          runtime module  - $enable_ldms_mod
+           Mofka         runtime module  - $enable_mofka_mod
            Memory alignment in bytes     - $with_mem_align
            Log file env variables        - $__log_path_by_env
            Location of Darshan log files - $__log_path

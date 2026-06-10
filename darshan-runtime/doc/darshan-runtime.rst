@@ -59,6 +59,12 @@ library is included in the Darshan build process. For more information about
 LDMS or LDMS streams please refer to the official `LDMS documentation
 <https://ovis-hpc.readthedocs.io/projects/ldms/en/latest/rst_man/index.html>`_.
 
+A parallel runtime streaming path is also available through the Mofka module,
+which publishes Darshan I/O records to a `Mofka <https://github.com/mochi-hpc/mofka>`_
+topic at runtime. The Mofka module is independent of the LDMS module; either,
+both, or neither can be enabled in a single Darshan build. See the
+``--with-mofka`` and ``--enable-mofka-mod`` configure options below.
+
 This document provides generic installation instructions, but "recipes" for
 several common HPC systems are provided at the end of the document as well.
 
@@ -240,6 +246,26 @@ Compilation
      * If LDMS is not installed on the system, please visit “Getting the
        Source” and “Building the Source” in the
        `LDMS Quick Start Guide <https://ovis-hpc.readthedocs.io/projects/ldms/en/latest/intro/quick-start.html>`_.
+* ``--enable-mofka-mod``: enables compilation and use of Darshan's Mofka runtime
+  module (default=disabled)
+* ``--with-mofka=DIR``:
+  installation directory for the Mofka client library
+
+  .. note::
+     * When ``--with-mofka=DIR`` is set, building the Mofka module is
+       automatically enabled.
+     * Detection uses pkg-config. ``--with-mofka=DIR`` prepends
+       ``DIR/lib/pkgconfig`` (or ``DIR/lib64/pkgconfig``) to
+       ``PKG_CONFIG_PATH``; ``--enable-mofka-mod`` alone relies on the
+       caller's ``PKG_CONFIG_PATH`` already containing a discoverable
+       ``mofka.pc``.
+     * The Mofka client library is C++. Enabling this module requires a
+       C++ compiler at build time.
+     * To collect runtime I/O records, you will need a running Mofka
+       service (a Bedrock daemon hosting a Mofka provider) and one or
+       more consumers subscribed to the configured topic. For details
+       on building Mofka and standing up a service see the
+       `Mofka repository <https://github.com/mochi-hpc/mofka>`_.
 
 Environment preparation
 ----------------------------------------
@@ -751,6 +777,19 @@ runtime:
      - Specifies the module data that will be collected during runtime using
        LDMS streams API. These only need to be exported (i.e.  setting to a
        value/string is optional).
+   * - DARSHAN_MOFKA_ENABLE=
+     - N/A
+     - Switch to initialize the Mofka producer at Darshan startup. If not
+       set, no Mofka traffic is generated. Only needs to be exported
+       (setting to a value/string is optional).
+   * - DARSHAN_MOFKA_GROUP_FILE=
+     - N/A
+     - Path to the Mofka group file (``mofka.json``) emitted by the
+       Bedrock daemon. Required when ``DARSHAN_MOFKA_ENABLE`` is set.
+   * - DARSHAN_MOFKA_TOPIC=
+     - ``darshan``
+     - Name of the Mofka topic to publish records to. Must exist on the
+       broker before Darshan starts.
 
 .. note::
  - Config file settings must be specified one per-line, with settings and
