@@ -13,6 +13,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>       /* clock_gettime for t0_epoch */
+#include <unistd.h>     /* gethostname */
 #include "darshan-mofka.h"
 #include "darshan.h"
 
@@ -39,8 +41,20 @@ struct darshanMofkaConnector mC = {
     .producer = NULL,
 };
 
-/* extern "C" entry points implemented in darshan-mofka-impl.cpp */
-extern void darshan_mofka_connector_initialize_impl(struct darshan_core_runtime *init_core);
+/*
+ * extern "C" entry points implemented in darshan-mofka-impl.cpp.
+ *
+ * Patch A: the C side extracts darshan-canonical identity (uid, jobid)
+ * from init_core and resolves record_id -> file path via
+ * darshan_core_lookup_record_name (which requires darshan.h, hence
+ * lives C-side). The C++ side receives the resolved values and is
+ * spared having to know about darshan_core_runtime internals.
+ */
+extern void darshan_mofka_connector_initialize_impl(
+    int64_t uid, int64_t jobid,
+    const char *hostname,
+    double t0_epoch);
+
 extern void darshan_mofka_connector_send_impl(uint64_t record_id, int64_t rank,
                                               int64_t record_count, char *rwo,
                                               int64_t offset, int64_t length,
@@ -48,12 +62,30 @@ extern void darshan_mofka_connector_send_impl(uint64_t record_id, int64_t rank,
                                               int64_t flushes,
                                               double start_time, double end_time,
                                               double total_time,
-                                              char *mod_name, char *data_type);
+                                              char *mod_name, char *data_type,
+                                              const char *file_path);
 extern void darshan_mofka_connector_finalize_impl(void);
 
 void darshan_mofka_connector_initialize(struct darshan_core_runtime *init_core)
 {
-    darshan_mofka_connector_initialize_impl(init_core);
+    /* Identity extraction: uid + jobid come from the darshan-canonical
+     * source (init_core->log_job_p); hostname from gethostname();
+     * t0_epoch from CLOCK_REALTIME at init. All cached C++ side so
+     * every record carries them. */
+    int64_t uid    = init_core ? init_core->log_job_p->uid   : (int64_t)0;
+    int64_t jobid  = init_core ? init_core->log_job_p->jobid : (int64_t)0;
+
+    char hostname[256];
+    if (gethostname(hostname, sizeof(hostname)) != 0)
+        snprintf(hostname, sizeof(hostname), "unknown");
+    hostname[sizeof(hostname) - 1] = '\0';
+
+    struct timespec ts;
+    double t0_epoch = 0.0;
+    if (clock_gettime(CLOCK_REALTIME, &ts) == 0)
+        t0_epoch = (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+
+    darshan_mofka_connector_initialize_impl(uid, jobid, hostname, t0_epoch);
 }
 
 void darshan_mofka_connector_send(uint64_t record_id, int64_t rank,
@@ -65,10 +97,17 @@ void darshan_mofka_connector_send(uint64_t record_id, int64_t rank,
                                   double total_time,
                                   char *mod_name, char *data_type)
 {
+    /* Resolve record_id -> file path on the C side (the C++ impl
+     * cannot include darshan.h). Returns NULL for unknown ids; the
+     * C++ side handles that. The returned pointer is borrowed into
+     * darshan-core's name hash; we pass it through to the C++ impl
+     * which uses it synchronously within this call. */
+    const char *file_path = (const char *)darshan_core_lookup_record_name(record_id);
+
     darshan_mofka_connector_send_impl(record_id, rank, record_count, rwo,
                                       offset, length, max_byte, rw_switch,
                                       flushes, start_time, end_time, total_time,
-                                      mod_name, data_type);
+                                      mod_name, data_type, file_path);
 }
 
 void darshan_mofka_connector_finalize(void)

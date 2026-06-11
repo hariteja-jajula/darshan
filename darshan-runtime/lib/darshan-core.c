@@ -445,6 +445,17 @@ void darshan_core_shutdown(int write_log)
     __darshan_core = NULL;
     __DARSHAN_CORE_UNLOCK();
 
+#ifdef HAVE_MOFKA
+    /* Flush mofka stream before the log-write path; runs on the
+     * !write_log path too (stream sink is independent of .darshan log). */
+    /* DEBUG breadcrumb: confirms darshan_core_shutdown reached our hook;
+     * remove with the rest of the debug scaffolding before upstream RFC. */
+    if (getenv("DARSHAN_MOFKA_DEBUG"))
+        fprintf(stderr, "darshan-mofka[DEBUG] pid=%ld core-shutdown: calling finalize (write_log=%d)\n",
+                (long)getpid(), write_log);
+    darshan_mofka_connector_finalize();
+#endif
+
     /* skip to cleanup if not writing a log */
     if(!write_log)
         goto cleanup;
