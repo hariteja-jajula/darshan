@@ -564,7 +564,12 @@ extern "C" void darshan_mofka_connector_send_impl(uint64_t record_id, int64_t ra
           "\"status\":\"FINISHED\""
         "}",
         mod_str,
-        (unsigned long long)record_id, (long)getpid(), (long long)record_count,
+        /* task_id is <record_id>-<pid>-<seq>; seq is the per-producer
+         * monotonic counter from Patch A so each send is globally unique.
+         * Using record_count here (per-record counter, often 1) caused
+         * flowcept's task-upsert to collapse repeated ops on the same file
+         * into a single mongo doc -- see C5_PHASE3_LEDGER.md Finding 3. */
+        (unsigned long long)record_id, (long)getpid(), (long long)my_seq,
         /* identity block */
         host_esc,
         (long long)g_identity.jobid,
