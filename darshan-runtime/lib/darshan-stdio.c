@@ -88,6 +88,7 @@
 #include "darshan-dynamic.h"
 #include "darshan-heatmap.h"
 #include "darshan-ldms.h"
+#include "darshan-mofka.h"
 
 #ifndef HAVE_OFF64_T
 typedef int64_t off64_t;
@@ -136,7 +137,7 @@ struct stdio_file_record_ref
     double last_read_end;
     double last_write_end;
     int fs_type;
-#ifdef HAVE_LDMS
+#if defined(HAVE_LDMS) || defined(HAVE_MOFKA)
     int64_t close_counts;
 #endif
 };
@@ -241,6 +242,10 @@ extern int __real_fileno(FILE *stream);
     if(dC.ldms_lib)\
         if(dC.stdio_enable_ldms)\
             darshan_ldms_connector_send(__rec_ref->file_rec->base_rec.id, __rec_ref->file_rec->base_rec.rank,__rec_ref->file_rec->counters[STDIO_OPENS], "open", -1, -1, -1, -1, -1, __tm1, __tm2, __rec_ref->file_rec->fcounters[STDIO_F_META_TIME], "STDIO", "MET");\
+    /* Mofka: parallel sink to LDMS, independent enable */ \
+    if(mC.mofka_lib)\
+        if(mC.stdio_enable_mofka)\
+            darshan_mofka_connector_send(__rec_ref->file_rec->base_rec.id, __rec_ref->file_rec->base_rec.rank,__rec_ref->file_rec->counters[STDIO_OPENS], "open", -1, -1, -1, -1, -1, __tm1, __tm2, __rec_ref->file_rec->fcounters[STDIO_F_META_TIME], "STDIO", "MET");\
 } while(0)
 
 #define STDIO_RECORD_REFOPEN(__ret, __rec_ref, __tm1, __tm2, __ref_counter) do { \
@@ -283,6 +288,10 @@ extern int __real_fileno(FILE *stream);
     if(dC.ldms_lib)\
         if(dC.stdio_enable_ldms) \
             darshan_ldms_connector_send(rec_ref->file_rec->base_rec.id, rec_ref->file_rec->base_rec.rank, rec_ref->file_rec->counters[STDIO_READS], "read", this_offset, __bytes, rec_ref->file_rec->counters[STDIO_MAX_BYTE_READ], -1, -1, __tm1, __tm2, rec_ref->file_rec->fcounters[STDIO_F_READ_TIME],"STDIO", "MOD"); \
+    /* Mofka: parallel sink to LDMS, independent enable */ \
+    if(mC.mofka_lib)\
+        if(mC.stdio_enable_mofka) \
+            darshan_mofka_connector_send(rec_ref->file_rec->base_rec.id, rec_ref->file_rec->base_rec.rank, rec_ref->file_rec->counters[STDIO_READS], "read", this_offset, __bytes, rec_ref->file_rec->counters[STDIO_MAX_BYTE_READ], -1, -1, __tm1, __tm2, rec_ref->file_rec->fcounters[STDIO_F_READ_TIME],"STDIO", "MOD"); \
 } while(0)
 
 #define STDIO_RECORD_WRITE(__fp, __bytes,  __tm1, __tm2, __fflush_flag) do{ \
@@ -310,6 +319,10 @@ extern int __real_fileno(FILE *stream);
     if(dC.ldms_lib)\
         if(dC.stdio_enable_ldms)\
             darshan_ldms_connector_send(rec_ref->file_rec->base_rec.id, rec_ref->file_rec->base_rec.rank, rec_ref->file_rec->counters[STDIO_WRITES], "write", this_offset, __bytes, rec_ref->file_rec->counters[STDIO_MAX_BYTE_WRITTEN], -1, rec_ref->file_rec->counters[STDIO_FLUSHES], __tm1, __tm2,  rec_ref->file_rec->fcounters[STDIO_F_WRITE_TIME], "STDIO", "MOD"); \
+    /* Mofka: parallel sink to LDMS, independent enable */ \
+    if(mC.mofka_lib)\
+        if(mC.stdio_enable_mofka)\
+            darshan_mofka_connector_send(rec_ref->file_rec->base_rec.id, rec_ref->file_rec->base_rec.rank, rec_ref->file_rec->counters[STDIO_WRITES], "write", this_offset, __bytes, rec_ref->file_rec->counters[STDIO_MAX_BYTE_WRITTEN], -1, rec_ref->file_rec->counters[STDIO_FLUSHES], __tm1, __tm2,  rec_ref->file_rec->fcounters[STDIO_F_WRITE_TIME], "STDIO", "MOD"); \
 } while(0)
 
 FILE* DARSHAN_DECL(fopen)(const char *path, const char *mode)
@@ -487,12 +500,22 @@ int DARSHAN_DECL(fclose)(FILE *fp)
             tm1, tm2, rec_ref->last_meta_end);
         darshan_delete_record_ref(&(stdio_runtime->stream_hash), &fp, sizeof(fp));
 
-#ifdef HAVE_LDMS
+#if defined(HAVE_LDMS) || defined(HAVE_MOFKA)
+        /* close_counts is needed by both runtime streaming sinks;
+         * the struct field guard widens to match (line ~140). */
         rec_ref->close_counts++;
         /* publish close information for stdio */
+#ifdef HAVE_LDMS
         if(dC.ldms_lib)
             if(dC.stdio_enable_ldms)
                 darshan_ldms_connector_send(rec_ref->file_rec->base_rec.id, rec_ref->file_rec->base_rec.rank, rec_ref->close_counts, "close", -1, -1, -1, -1, rec_ref->file_rec->counters[STDIO_FLUSHES], tm1, tm2, rec_ref->file_rec->fcounters[STDIO_F_META_TIME], "STDIO", "MOD");
+#endif
+#ifdef HAVE_MOFKA
+        /* Mofka: parallel sink to LDMS, independent enable */
+        if(mC.mofka_lib)
+            if(mC.stdio_enable_mofka)
+                darshan_mofka_connector_send(rec_ref->file_rec->base_rec.id, rec_ref->file_rec->base_rec.rank, rec_ref->close_counts, "close", -1, -1, -1, -1, rec_ref->file_rec->counters[STDIO_FLUSHES], tm1, tm2, rec_ref->file_rec->fcounters[STDIO_F_META_TIME], "STDIO", "MOD");
+#endif
 #endif
     }
     STDIO_POST_RECORD();

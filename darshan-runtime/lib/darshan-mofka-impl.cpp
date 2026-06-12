@@ -432,6 +432,16 @@ extern "C" void darshan_mofka_connector_send_impl(uint64_t record_id, int64_t ra
                                                   char *mod_name, char *data_type,
                                                   const char *file_path)
 {
+    /* C5b re-entrancy guard (per architectural_decisions.md AD-21).
+     * Our own stderr writes (dbg, breaker line) are themselves
+     * instrumented I/O once STDIO sites are active; without this guard
+     * a single push() can recurse through STDIO_RECORD_WRITE back into
+     * send_impl. Thread-local so concurrent producer threads stay
+     * independent. */
+    static thread_local int in_send = 0;
+    if (in_send) return;
+    struct guard { guard() { in_send = 1; } ~guard() { in_send = 0; } } _g;
+
     /* fast-path no-op when producer not connected (init failed or the
      * user did not set DARSHAN_MOFKA_ENABLE) */
     if (g_state == nullptr || mC.producer == nullptr) {
