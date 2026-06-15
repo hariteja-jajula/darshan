@@ -22,10 +22,11 @@ C_SRCS = darshan-core-init-finalize.c \
          lookup3.c \
          lookup8.c
 
+# P3 retarget: darshan-runtime is now pure C. The vendored C++ bridge
+# darshan-mofka-impl.cpp was deleted; the C++ side lives behind the
+# diaspora-c bindings in its own library. CXX_SRCS kept (empty) so
+# libdarshan_la_SOURCES references below don't need to change.
 CXX_SRCS =
-if HAVE_MOFKA
-   CXX_SRCS += darshan-mofka-impl.cpp
-endif
 
 if BUILD_NULL_MODULE
    C_SRCS += darshan-null.c
@@ -116,12 +117,14 @@ libdarshan_la_LDFLAGS = -L$(LDMS_HOME)/lib -Wl,-rpath=$(LDMS_HOME)/lib
 endif
 
 if HAVE_MOFKA
+# MOFKA_LIBS / MOFKA_CFLAGS are now aliased from DIASPORA_C_LIBS /
+# DIASPORA_C_CFLAGS in configure.ac (DARSHAN_CHECK_DIASPORA_C).
+# pkg-config's diaspora-c.pc declares `Requires: diaspora-stream-api`
+# so the underlying C++ lib is pulled in transitively for the linker.
 libdarshan_la_LIBADD   += $(MOFKA_LIBS)
 libdarshan_la_CPPFLAGS += $(MOFKA_CFLAGS)
-# Mofka headers use C++17 features (std::string_view, etc.); apply
-# the standard flag only to the C++ translation unit so the existing
-# C sources are unaffected.
-libdarshan_la_CXXFLAGS = $(AM_CXXFLAGS) -std=c++17
+# No -std=c++17, no CXXFLAGS line: darshan-runtime is pure C in this
+# branch (P3). The C++ machinery lives behind diaspora-c's boundary.
 endif
 
 H_SRCS = darshan-common.h \
@@ -142,7 +145,6 @@ EXTRA_DIST = $(H_SRCS) \
              darshan-dxt.c \
              darshan-ldms.c \
              darshan-mofka.c \
-             darshan-mofka-impl.cpp \
              darshan-mpiio.c \
              darshan-pnetcdf.c \
              darshan-pnetcdf-api.m4 \

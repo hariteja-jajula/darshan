@@ -613,53 +613,34 @@ if test "x$enable_darshan_runtime" = xyes ; then
       CHECK_LDMS
    fi
 
-   # inform about Mofka installs not found in default locations
-   AC_ARG_WITH([mofka],
-      [AS_HELP_STRING([--with-mofka@<:@=DIR@:>@],
-                      [Installation directory for Mofka client library.])]
-   )
+   # P3 retarget: Mofka support now goes through the diaspora-c bindings
+   # (pure C). What disappeared relative to the vendored branch:
+   #   - --with-mofka (and the pkg-config path manipulation for it)
+   #   - --enable-mofka-mod (auto-enabled by --with-diaspora-c presence)
+   #   - AC_PROG_CXX + the C++17 probe (no C++ TU exists in this branch)
+   #   - --with-nlohmann-json-schema (transitively private via diaspora-c)
+   # HAVE_MOFKA is kept as the output macro so the ~20 guarded call sites
+   # across darshan-{core,posix,stdio,mpiio,hdf5}.c need ZERO changes --
+   # that invariance is the design point of the retarget.
+   DARSHAN_CHECK_DIASPORA_C
 
-   # Mofka support (disabled by default)
-   AC_ARG_ENABLE([mofka-mod],
-      [AS_HELP_STRING([--enable-mofka-mod],
-                      [Include Mofka for runtime I/O record streaming])]
-   )
-
-   # When --with-mofka is set, automatically enable enable_mofka_mod
-   if test "x$enable_mofka_mod" = x ; then
-      if test "x$with_mofka" != x ; then
-         enable_mofka_mod=yes
-      else
-         enable_mofka_mod=no
-      fi
+   # Back-compat: enable_mofka_mod still appears in AC_SUBST below; mirror
+   # the diaspora-c detection result so downstream uses stay consistent.
+   # Also alias DIASPORA_C_{LIBS,CFLAGS} as MOFKA_{LIBS,CFLAGS} so the
+   # existing lib/Makefile.am bits at :119-120 keep working without
+   # rewriting (one less invasive change in the retarget).
+   if test "x$have_diaspora_c" = "xyes" ; then
+      enable_mofka_mod=yes
+      with_mofka="$with_diaspora_c"
+      MOFKA_LIBS="$DIASPORA_C_LIBS"
+      MOFKA_CFLAGS="$DIASPORA_C_CFLAGS"
+   else
+      enable_mofka_mod=no
+      MOFKA_LIBS=""
+      MOFKA_CFLAGS=""
    fi
-
-   # AC_PROG_CXX must be called unconditionally (Automake requirement: the
-   # am__fastdepCXX conditional must be defined at config time even when we
-   # don't end up compiling any C++. Mofka is the only C++ user today; if
-   # --with-mofka is not given, this just probes for a C++ compiler and
-   # never uses it.)
-   AC_PROG_CXX
-
-   if test "x$enable_mofka_mod" = xyes ; then
-      # locate mofka via pkg-config; --with-mofka can prepend to PKG_CONFIG_PATH
-      # (also include share/pkgconfig: nlohmann_json.pc typically lives there)
-      if test "x$with_mofka" != x && test "x$with_mofka" != xyes ; then
-         if test -d "$with_mofka/lib/pkgconfig" ; then
-            PKG_CONFIG_PATH="$with_mofka/lib/pkgconfig:$PKG_CONFIG_PATH"
-         elif test -d "$with_mofka/lib64/pkgconfig" ; then
-            PKG_CONFIG_PATH="$with_mofka/lib64/pkgconfig:$PKG_CONFIG_PATH"
-         else
-            AC_MSG_ERROR([Mofka installation path, $with_mofka, has no lib/pkgconfig or lib64/pkgconfig directory])
-         fi
-         if test -d "$with_mofka/share/pkgconfig" ; then
-            PKG_CONFIG_PATH="$with_mofka/share/pkgconfig:$PKG_CONFIG_PATH"
-         fi
-         export PKG_CONFIG_PATH
-      fi
-
-      CHECK_MOFKA
-   fi
+   AC_SUBST(MOFKA_LIBS)
+   AC_SUBST(MOFKA_CFLAGS)
 
    dnl sanity check some config parameters
    if test "x$GOT_LOG_PATH" != xyes ; then
