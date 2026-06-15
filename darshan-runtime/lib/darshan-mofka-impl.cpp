@@ -75,8 +75,11 @@
 #include <string>
 #include <string_view>
 #include <memory>
-#include <mutex>      /* std::once_flag for one-shot atfork registration */
-#include <atomic>     /* std::atomic<bool> for push circuit breaker */
+#include <mutex>      /* std::once_flag for one-shot atfork registration;
+                       * std::mutex for S4 stall-detector adopt/clear */
+#include <atomic>     /* std::atomic<bool> for push circuit breaker + stall */
+#include <optional>   /* S4 stall-detector: std::optional<Future<...>> oldest */
+#include <chrono>     /* S4 stall-detector: steady_clock for wallclock age */
 #include <exception>
 
 #include <diaspora/Driver.hpp>
@@ -85,6 +88,8 @@
 #include <diaspora/Metadata.hpp>
 #include <diaspora/Ordering.hpp>
 #include <diaspora/BatchParams.hpp>
+#include <diaspora/Future.hpp>   /* S4 stall-detector: Future<optional<EventID>> */
+#include <diaspora/EventID.hpp>  /* S4: EventID type for the Future template arg */
 
 extern "C" {
 #include "darshan-mofka.h"
@@ -142,6 +147,55 @@ static std::unique_ptr<MofkaState> g_state;
  * Re-arm is a documented followup (DARSHAN_MOFKA_REARM_SEC).
  */
 static std::atomic<bool> push_broken{false};
+
+/*
+ * S4 stall detector ("B2" in the RFC three-layer story: B insurance /
+ * B2 mid-run stall+memory bound / D exit backstop).
+ *
+ * Mechanism: track the OLDEST unacknowledged push as a Future<...>;
+ * if its wallclock age exceeds DARSHAN_MOFKA_STALL_TIMEOUT_SEC (default
+ * 5s; 0 disables), trip `push_stalled` permanently and short-circuit
+ * subsequent pushes (same effect as the circuit breaker, but a separate
+ * bit so the RFC's B-vs-B2 distinction stays greppable in the trip
+ * stderr line).
+ *
+ * Adopt-only-when-empty (one Future tracked at a time -- always the
+ * oldest unacked). Lazy clear inside the age check: if the tracked
+ * Future has completed, reset and don't trip. operator bool() is
+ * load-bearing -- completed() throws on default-constructed Futures
+ * (Future.hpp:80-84); engaged push()-returned Futures never throw and
+ * the call is a non-blocking atomic read (Promise.hpp:46-50 + 65-67;
+ * verified by S4_MX_response.md). Mechanism + ranked design shapes:
+ * see ~/setup/notes/agents/S4_HX_response.md + S4_MX_response.md.
+ *
+ * Earns RFC three-layer separation: when the stall trip fires, the
+ * stderr line uses the literal string "STALL detected" -- the test
+ * harness greps for this exact string to distinguish a stall trip
+ * from a circuit-breaker trip ("push failed").
+ */
+static std::mutex                                              stall_mtx;
+static std::optional<diaspora::Future<std::optional<diaspora::EventID>>> stall_oldest;
+static std::chrono::steady_clock::time_point                  stall_oldest_t0{};
+static std::atomic<bool>                                       push_stalled{false};
+
+/* Resolve DARSHAN_MOFKA_STALL_TIMEOUT_SEC once, cache thereafter.
+ * Same idiom as dbg_enabled() (:206-214). 0 disables; default 5s. */
+static int stall_timeout_sec()
+{
+    static int cached = -2;  /* -2 = not yet read; -1 = disabled */
+    if (cached == -2) {
+        const char* v = std::getenv("DARSHAN_MOFKA_STALL_TIMEOUT_SEC");
+        if (v == nullptr || *v == '\0') {
+            cached = 5;
+        } else {
+            int n = std::atoi(v);
+            if (n <= 0)        cached = -1;   /* disabled */
+            else if (n > 3600) cached = 3600; /* clamp */
+            else               cached = n;
+        }
+    }
+    return cached;
+}
 
 /*
  * Schema v0 identity block (Patch A). Captured once at init; carried
@@ -460,6 +514,65 @@ extern "C" void darshan_mofka_connector_send_impl(uint64_t record_id, int64_t ra
         return;
     }
 
+    /* S4 stall-detector ("B2"). Same hot-path short-circuit shape as
+     * the breaker, separate bit so the trip line is greppable as
+     * "STALL detected" rather than "push failed". Sibling check; one
+     * extra relaxed atomic load per send when not tripped. */
+    if (push_stalled.load(std::memory_order_relaxed)) {
+        dbg("send: SKIP (stalled) op=%s rec=%016llx",
+            rwo ? rwo : "?", (unsigned long long)record_id);
+        return;
+    }
+
+    /* S4 stall-detector age check (runs IFF threshold > 0). Done before
+     * the JSON build so a stalled producer doesn't even pay the snprintf
+     * cost. Lazy clear: if the tracked Future has completed (or is
+     * somehow invalid), reset stall_oldest and don't trip. Trip is
+     * one-shot (static once_flag for the stderr line). */
+    if (int sth = stall_timeout_sec(); sth > 0) {
+        bool should_trip = false;
+        double age_sec = 0.0;
+        {
+            std::lock_guard<std::mutex> lk(stall_mtx);
+            if (stall_oldest) {
+                /* operator bool guards completed() against the default-
+                 * constructed-Future throw path (Future.hpp:80-84).
+                 * For push()-returned Futures, completed() is a non-
+                 * blocking atomic read into Promise's m_is_set
+                 * (Promise.hpp:46-50, 65-67; verified MX-S4 §Q2). */
+                if (!static_cast<bool>(*stall_oldest) ||
+                    stall_oldest->completed())
+                {
+                    stall_oldest.reset();   /* lazy clear */
+                } else {
+                    std::chrono::duration<double> age =
+                        std::chrono::steady_clock::now() - stall_oldest_t0;
+                    age_sec = age.count();
+                    if (age_sec > static_cast<double>(sth)) {
+                        should_trip = true;
+                    }
+                }
+            }
+        }
+        if (should_trip) {
+            push_stalled.store(true, std::memory_order_relaxed);
+            /* One-shot stderr line. Fixed-string-stable for harness grep:
+             * "darshan-mofka: STALL detected". Do NOT mutate this prefix
+             * without updating the S4 monitor scripts. */
+            static std::once_flag stall_once;
+            std::call_once(stall_once, [age_sec, sth] {
+                std::fprintf(stderr,
+                    "darshan-mofka: STALL detected: oldest push pending "
+                    "%.3fs > %ds threshold; subsequent pushes will be "
+                    "dropped silently.\n",
+                    age_sec, sth);
+            });
+            dbg("send: SKIP (stall trip first hit, age=%.3fs) op=%s rec=%016llx",
+                age_sec, rwo ? rwo : "?", (unsigned long long)record_id);
+            return;
+        }
+    }
+
     /* defensive: per-module enable check (call sites already gate, but
      * the cost of strcmp on a short literal is negligible compared
      * to the JSON build + push below) */
@@ -621,7 +734,24 @@ extern "C" void darshan_mofka_connector_send_impl(uint64_t record_id, int64_t ra
     try {
         auto* producer = static_cast<diaspora::Producer*>(mC.producer);
         diaspora::Metadata meta{std::string{jbuf}};
-        (void)producer->push(meta);  /* Future intentionally dropped */
+        auto fut = producer->push(meta);
+        /* S4 stall-detector: adopt-only-when-empty. If we're already
+         * tracking an oldest unacked Future, leave it (we want the
+         * OLDEST, not the most recent -- otherwise a slow steady
+         * stream of pushes would never trip). Cost: one mutex acquire
+         * per push when no oldest tracked + one move-construct; zero
+         * when oldest is engaged. Move-construct is cheap (Future is
+         * two std::function slots = ~48 bytes; defaulted move).
+         * Lifetime: Promise's m_state is a shared_ptr held inside the
+         * Future's closures, so the Future outlives the producer if
+         * needed (MX-S4 §Q5 architectural note). */
+        if (stall_timeout_sec() > 0) {
+            std::lock_guard<std::mutex> lk(stall_mtx);
+            if (!stall_oldest) {
+                stall_oldest = std::move(fut);
+                stall_oldest_t0 = std::chrono::steady_clock::now();
+            }
+        }
         dbg("send: PUSH ok (json_bytes=%d)", n);
     } catch (const std::exception& e) {
         dbg("send: PUSH EXCEPTION (%s); tripping circuit breaker", e.what());
