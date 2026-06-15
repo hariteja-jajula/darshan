@@ -146,6 +146,20 @@ static int darshan_deflate_buffer(
 static void darshan_core_cleanup(
     struct darshan_core_runtime* core);
 static void darshan_core_fork_child_cb(void);
+
+/* S2-disc (2026-W25): set to 1 while we are inside the pthread_atfork
+ * CHILD handler's darshan_core_shutdown(0) call, so the mofka finalize
+ * block in darshan_core_shutdown can be skipped on the fork-child path
+ * (the COW-inherited thallium engine has no surviving progress threads;
+ * calling producer->flush().wait() there parks ~10s on Mercury's na_ofi
+ * RPC timeout and corrupts the parent's shared progress engine). See
+ * ~/setup/notes/agents/HX-1_response.md + DX-3_response.md + MX-3
+ * Section B for the mechanism trail; CHECK_IN_S2_FORENSIC.md for the
+ * full evidence package. Pairs with mofka-side PR #18 idiom adoption
+ * planned as S2d half-(a).
+ */
+static int in_atfork_child = 0;
+
 #ifdef HAVE_MPI
 static void darshan_core_reduce_min_time(
     void* in_time_v, void* inout_time_v,
@@ -355,8 +369,32 @@ void darshan_core_initialize(int argc, char **argv)
 
 #ifdef HAVE_MOFKA
         /* check if user turns on Mofka -- pass init_core to darshan-mofka connector initialization */
-        if (getenv("DARSHAN_MOFKA_ENABLE"))
+        /* S2-disc Option-alpha (2026-W25, empirical addendum): also skip mofka
+         * INIT on the fork-child re-entry path. The first S2-disc edit guarded
+         * the destructive finalize (flush().wait() on COW-inherited producer);
+         * a live burst on bdw-0040 2026-06-15 10:36 then revealed the SECOND
+         * wedge HX-1 had named -- darshan_core_fork_child_cb's re-init at
+         * :2273 calls darshan_core_initialize(0,NULL) which re-runs this site,
+         * which tries to construct a second MofkaDriver in the same process
+         * group; mofka's process-global engine registry returns "shared
+         * progress engine with existing drivers" and the second construction
+         * wedges on stale thallium state inherited via COW. Bash subshells in
+         * LD_PRELOAD'd chains routinely fork (gotcha G2), so this fires on
+         * every shell helper. The fork-child's mofka_atfork_child
+         * (impl.cpp:191-197) has already nulled mC.{driver,topic,producer}
+         * and released g_state safely; skipping init here keeps the child in
+         * that safe nulled state -- subsequent send_impl calls in the child
+         * short-circuit (mC.producer==NULL). Pairs with S2d half-(a) (mofka
+         * PR #18 idiom in impl.cpp) as the structural followup -- that one
+         * lets the child re-init with its own progress thread cleanly. This
+         * alpha addendum is the C-only belt-and-braces version.
+         * Evidence: ~/setup/test/phase1/logs/2026-06-15/S2DISC_HALF_WIN_keepforever/.
+         */
+        if (!in_atfork_child && getenv("DARSHAN_MOFKA_ENABLE"))
             darshan_mofka_connector_initialize(init_core);
+        else if (in_atfork_child && getenv("DARSHAN_MOFKA_DEBUG"))
+            fprintf(stderr, "darshan-mofka[DEBUG] pid=%ld core-init: SKIPPED mofka init (in_atfork_child=1)\n",
+                    (long)getpid());
 #endif
 
         /* if darshan was successfully initialized, set the global pointer
@@ -447,13 +485,28 @@ void darshan_core_shutdown(int write_log)
 
 #ifdef HAVE_MOFKA
     /* Flush mofka stream before the log-write path; runs on the
-     * !write_log path too (stream sink is independent of .darshan log). */
-    /* DEBUG breadcrumb: confirms darshan_core_shutdown reached our hook;
-     * remove with the rest of the debug scaffolding before upstream RFC. */
-    if (getenv("DARSHAN_MOFKA_DEBUG"))
-        fprintf(stderr, "darshan-mofka[DEBUG] pid=%ld core-shutdown: calling finalize (write_log=%d)\n",
+     * !write_log path too (stream sink is independent of .darshan log).
+     * S2-disc: but NOT on the fork-child path -- there the COW-inherited
+     * thallium engine has no progress threads to drive the C++
+     * producer->flush().wait(), which would park ~10s on Mercury's na_ofi
+     * RPC timeout and corrupt the parent's shared engine. Mofka's atfork
+     * CHILD handler (impl.cpp:191-197) handles the safe null+release for
+     * that path; this guard keeps darshan-core from re-entering the
+     * destructive path. */
+    if (!in_atfork_child)
+    {
+        /* DEBUG breadcrumb: confirms darshan_core_shutdown reached our hook;
+         * remove with the rest of the debug scaffolding before upstream RFC. */
+        if (getenv("DARSHAN_MOFKA_DEBUG"))
+            fprintf(stderr, "darshan-mofka[DEBUG] pid=%ld core-shutdown: calling finalize (write_log=%d)\n",
+                    (long)getpid(), write_log);
+        darshan_mofka_connector_finalize();
+    }
+    else if (getenv("DARSHAN_MOFKA_DEBUG"))
+    {
+        fprintf(stderr, "darshan-mofka[DEBUG] pid=%ld core-shutdown: SKIPPED mofka finalize (in_atfork_child=1, write_log=%d)\n",
                 (long)getpid(), write_log);
-    darshan_mofka_connector_finalize();
+    }
 #endif
 
     /* skip to cleanup if not writing a log */
@@ -2240,8 +2293,18 @@ static void darshan_core_fork_child_cb(void)
             orig_parent_pid = parent_pid;
 
         /* shutdown and re-init darshan, making sure to not write out a log file */
+        /* S2-disc: gate the mofka finalize block in darshan_core_shutdown
+         * for the duration of this fork-child shutdown+reinit pair. The
+         * COW-inherited thallium engine has no progress threads in the
+         * child; running the C++ producer->flush().wait() down there
+         * deadlocks behind Mercury's RPC timeout and corrupts the parent's
+         * shared progress engine. Mofka's own atfork-child handler
+         * (impl.cpp:191-197) does the safe null+release work; this guard
+         * just keeps darshan-core from undoing it. */
+        in_atfork_child = 1;
         darshan_core_shutdown(0);
         darshan_core_initialize(0, NULL);
+        in_atfork_child = 0;
     }
 
     return;
