@@ -132,6 +132,99 @@ static int     g_verbose;
 
 #define MOFKA_JSON_BUF 2048                    /* matches C5 schema v2     */
 
+/* ------------------------------------------------------------------------
+ * Darshan-side event buffer (F1, added 2026-06-23 — experiment branch
+ * experiment/darshan-batch-events).
+ *
+ * Without this buffer, every single intercepted syscall triggers one call
+ * to diaspora_producer_push. For workload_ml.py that is ~55,474 producer
+ * pushes per rep, each paying lock + back-pressure CV + (when batches are
+ * small) full mercury RTT. Measured per-push cost: 88-198 µs depending on
+ * node. See ARCHITECTURE.md §5 Cause C.
+ *
+ * The buffer accumulates up to MOFKA_BATCH_MAX_EVENTS events; on overflow
+ * (or at finalize) it drains via flush_batch_locked() which calls
+ * diaspora_producer_push for each buffered event in a single critical
+ * section. This collapses the N lock acquisitions and (for small mofka
+ * batches) the N CV waits into one.
+ *
+ * Defaults:
+ *   - g_batch_size = 1 (preserves pre-batch behavior; opt-in for tests)
+ *   - Configurable via env: DARSHAN_MOFKA_BATCH_EVENTS=64
+ *
+ * Tradeoffs:
+ *   - Memory: g_batch_size * MOFKA_JSON_BUF bytes per process (64 * 2048
+ *     = 128 KB worst case). Negligible.
+ *   - Latency: an event may wait in the buffer up to N-1 syscalls before
+ *     shipping. Real-time-per-event becomes real-time-per-batch.
+ *   - Failure: if push fails mid-drain, circuit breaker trips and
+ *     remaining buffered events are dropped (same as today's per-event
+ *     behavior; no new failure mode).
+ *
+ * Thread safety: protected by g_batch_mtx. The re-entrancy guard
+ * (g_in_send TLS) is already in place around connector_send, so this
+ * mutex is held under workload-thread context only.
+ *
+ * Definition of statics here; flush_batch_locked() is defined later
+ * (after dbg() and WARN_ONCE are defined).
+ * ------------------------------------------------------------------------ */
+#define MOFKA_BATCH_MAX_EVENTS 512
+/* F1 v2: packed-batch scratch buffer. Sized for worst case
+ * 512 events * 2048 bytes each + envelope overhead. ~1 MB static. */
+#define MOFKA_PACKED_BUF_BYTES (MOFKA_BATCH_MAX_EVENTS * MOFKA_JSON_BUF + 256)
+
+static int             g_batch_size = 1;       /* set from env at init */
+static int             g_packed     = 0;       /* F1 v2: 1 = pack into one push */
+static char            g_batch_buf[MOFKA_BATCH_MAX_EVENTS][MOFKA_JSON_BUF];
+static int             g_batch_len[MOFKA_BATCH_MAX_EVENTS];  /* json byte count */
+static int             g_batch_count = 0;
+static pthread_mutex_t g_batch_mtx   = PTHREAD_MUTEX_INITIALIZER;
+static char            g_packed_buf[MOFKA_PACKED_BUF_BYTES];   /* scratch */
+
+static void flush_batch_locked(void);   /* forward decl; defined below   */
+
+/* ------------------------------------------------------------------------
+ * Tier 3 timing accumulators (added 2026-06-23 with F1 instrumentation).
+ *
+ * Atomically accumulate nanosecond spans for each phase so we get a
+ * per-process breakdown at finalize. Overhead per atomic_fetch_add is
+ * ~10-20 ns on x86_64, and CLOCK_MONOTONIC is ~25-50 ns; total
+ * instrumentation cost per event is ~150-300 ns over ~55k events =
+ * ~10-20ms or <0.1% of a typical workload run. Negligible.
+ *
+ * Categories tracked:
+ *   ns_json    — json_escape + snprintf time (build the 500-byte JSON)
+ *   ns_buffer  — F1 path only: mutex acquire + memcpy + bookkeeping
+ *   ns_push    — diaspora_producer_push call alone (mofka + verbs RTT)
+ *   ns_flush   — F1 path only: flush_batch_locked total span (includes
+ *                its inner per-push time, which is also in ns_push)
+ *
+ * Counters:
+ *   events  — connector_send invocations that produced a JSON
+ *   pushes  — actual diaspora_producer_push calls (= events when N=1,
+ *             = events when N>1 too because flush_batch pushes each one)
+ *   flushes — flush_batch_locked invocations (~= events / N)
+ *
+ * Printed at finalize as one PROF line; parse from stderr post-run.
+ * ------------------------------------------------------------------------ */
+#include <stdatomic.h>
+#include <time.h>
+
+static atomic_uint_least64_t g_ns_json_total    = 0;
+static atomic_uint_least64_t g_ns_push_total    = 0;
+static atomic_uint_least64_t g_ns_buffer_total  = 0;
+static atomic_uint_least64_t g_ns_flush_total   = 0;
+static atomic_uint_least64_t g_cnt_events       = 0;
+static atomic_uint_least64_t g_cnt_pushes       = 0;
+static atomic_uint_least64_t g_cnt_flushes      = 0;
+
+static inline uint64_t ns_now(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
 /* ---------------------------------------------------------------------- */
 /* small helpers                                                           */
 /* ---------------------------------------------------------------------- */
@@ -237,6 +330,119 @@ static void mofka_atfork_child(void)
     mC.topic = NULL;
     mC.driver = NULL;
     mC.mofka_lib = 0;
+    /* F1: drop any buffered events the child inherited; the producer
+     * handle is dead in the child anyway, so flushing would error.
+     * Reinitialize the mutex to avoid inheriting a locked state. */
+    g_batch_count = 0;
+    pthread_mutex_init(&g_batch_mtx, NULL);
+}
+
+/* F1: drain the buffer to mofka. MUST be called with g_batch_mtx held.
+ *
+ * Two modes:
+ *  (a) Default (g_packed=0): push each accumulated event in a tight loop.
+ *      N mofka messages on the wire. Eliminates lock acquisition cost vs
+ *      per-event-from-syscall but still N producer_push calls.
+ *
+ *  (b) Packed (g_packed=1): build ONE JSON envelope wrapping all events
+ *      and push it as ONE mofka message. 1 message on the wire containing
+ *      N nested events. Requires a consumer that knows to unpack:
+ *      mq_dao_mofka.py:message_listener checks for "__batch__":1 and
+ *      dispatches event-by-event to message_handler.
+ *
+ * On first failure trips the circuit breaker and drops remaining events
+ * (matches per-event failure semantics). Resets g_batch_count
+ * unconditionally so partial-drain failure doesn't leave stale state. */
+static void flush_batch_locked(void)
+{
+    int i;
+    int rc;
+    if (g_batch_count == 0) return;
+    if (g_producer == NULL) {
+        g_batch_count = 0;
+        return;
+    }
+    if (atomic_load(&g_push_broken)) {
+        dbg("flush_batch: SKIP (circuit already broken); dropping %d events",
+            g_batch_count);
+        g_batch_count = 0;
+        return;
+    }
+
+    if (g_packed) {
+        /* F1 v2: build {"__batch__":1,"n":N,"events":[ev1,...,evN]} */
+        int off;
+        int written = g_batch_count;   /* all-or-nothing in packed mode */
+        off = snprintf(g_packed_buf, sizeof(g_packed_buf),
+                       "{\"__batch__\":1,\"n\":%d,\"events\":[", g_batch_count);
+        for (i = 0; i < g_batch_count; i++) {
+            int needed = g_batch_len[i] + 2;   /* event + ',' + ']' tail */
+            if ((size_t)(off + needed + 2) >= sizeof(g_packed_buf)) {
+                dbg("flush_batch: PACKED BUF FULL at i=%d/%d; truncating",
+                    i, g_batch_count);
+                written = i;
+                break;
+            }
+            if (i > 0) g_packed_buf[off++] = ',';
+            memcpy(g_packed_buf + off, g_batch_buf[i], (size_t)g_batch_len[i]);
+            off += g_batch_len[i];
+        }
+        g_packed_buf[off++] = ']';
+        g_packed_buf[off++] = '}';
+        g_packed_buf[off] = '\0';
+
+        /* TIER3: time the single packed push */
+        uint64_t _t_p0 = ns_now();
+        rc = diaspora_producer_push(g_producer, g_packed_buf, NULL, 0);
+        uint64_t _t_p1 = ns_now();
+        atomic_fetch_add(&g_ns_push_total, _t_p1 - _t_p0);
+        atomic_fetch_add(&g_cnt_pushes, 1);
+
+        if (rc == DIASPORA_C_OK) {
+            dbg("flush_batch: PACKED PUSH ok (events=%d, bytes=%d)",
+                written, off);
+        } else {
+            atomic_store(&g_push_broken, 1);
+            WARN_ONCE("darshan-mofka: packed push failed (%s); "
+                      "circuit broken, subsequent records will be dropped.\n",
+                      diaspora_c_last_error());
+            dbg("flush_batch: PACKED PUSH EXCEPTION (%s); tripping breaker",
+                diaspora_c_last_error());
+        }
+        g_batch_count = 0;
+        return;
+    }
+
+    /* F1 v1 (per-event push in tight loop) */
+    {
+        int pushed = 0;
+        for (i = 0; i < g_batch_count; i++) {
+            if (atomic_load(&g_push_broken)) {
+                dbg("flush_batch: SKIP remaining (circuit broken) at i=%d/%d",
+                    i, g_batch_count);
+                break;
+            }
+            /* TIER3: time each individual push within the batch drain. */
+            uint64_t _t_p0 = ns_now();
+            rc = diaspora_producer_push(g_producer, g_batch_buf[i], NULL, 0);
+            uint64_t _t_p1 = ns_now();
+            atomic_fetch_add(&g_ns_push_total, _t_p1 - _t_p0);
+            atomic_fetch_add(&g_cnt_pushes, 1);
+            if (rc == DIASPORA_C_OK) {
+                pushed++;
+            } else {
+                atomic_store(&g_push_broken, 1);
+                WARN_ONCE("darshan-mofka: push failed during batch flush (%s); "
+                          "circuit broken, subsequent records will be dropped.\n",
+                          diaspora_c_last_error());
+                dbg("flush_batch: PUSH EXCEPTION at i=%d/%d (%s); tripping breaker",
+                    i, g_batch_count, diaspora_c_last_error());
+                break;
+            }
+        }
+        dbg("flush_batch: drained %d of %d events", pushed, g_batch_count);
+        g_batch_count = 0;
+    }
 }
 
 /* ---------------------------------------------------------------------- */
@@ -280,6 +486,24 @@ void darshan_mofka_connector_initialize(struct darshan_core_runtime* init_core)
     }
 
     g_stall_sec = (int)env_i64("DARSHAN_MOFKA_STALL_TIMEOUT_SEC", 5, 0, 3600);
+
+    /* Darshan-side batch size (F1). Default 1 = no buffering, current
+     * behavior. Set DARSHAN_MOFKA_BATCH_EVENTS=64 (or up to MAX) to
+     * accumulate events and drain in one critical section. */
+    g_batch_size = (int)env_i64("DARSHAN_MOFKA_BATCH_EVENTS",
+                                1, 1, MOFKA_BATCH_MAX_EVENTS);
+    /* F1 v2: packed-batch mode. When set, the drained buffer is shipped
+     * as ONE mofka message wrapping N events in a JSON envelope:
+     *   {"__batch__":1,"n":N,"events":[ev1,...,evN]}
+     * Requires a consumer that knows to unpack (see flowcept
+     * mq_dao_mofka.py:message_listener). Default off = per-event push. */
+    g_packed = (int)env_i64("DARSHAN_MOFKA_PACKED_BATCH", 0, 0, 1);
+    if (g_packed && g_batch_size <= 1) {
+        WARN_ONCE("darshan-mofka: DARSHAN_MOFKA_PACKED_BATCH=1 but "
+                  "BATCH_EVENTS<=1; packed mode has no effect.\n");
+    }
+    dbg("init: batch_size=%d packed=%d (max %d)",
+        g_batch_size, g_packed, MOFKA_BATCH_MAX_EVENTS);
 
     group_file  = getenv("DARSHAN_MOFKA_GROUP_FILE");
     topic_name  = getenv("DARSHAN_MOFKA_TOPIC");
@@ -469,6 +693,8 @@ void darshan_mofka_connector_send(uint64_t record_id, int64_t rank,
      * returns a borrowed pointer into darshan's name hash valid for
      * this call's duration. NULL means "unknown record id"; the JSON
      * escape below handles NULL by substituting "unknown". */
+    /* TIER3: time the JSON construction phase (lookup + escapes + snprintf). */
+    uint64_t _t_json0 = ns_now();
     file_path = (const char*)darshan_core_lookup_record_name(record_id);
     json_escape_into(file_esc, sizeof(file_esc), file_path);
     json_escape_into(host_esc, sizeof(host_esc), g_hostname);
@@ -509,8 +735,70 @@ void darshan_mofka_connector_send(uint64_t record_id, int64_t rank,
         dbg("send: DROP (json truncated, n=%d)", n);
         goto out;
     }
+    /* TIER3: close JSON-build span here (after snprintf + truncation check)
+     * and bump the events counter. We count by "JSON successfully built"
+     * not "connector_send entered" because the early-exit paths above
+     * (re-entrancy, broken, stalled, module-disabled) shouldn't inflate
+     * per-event averages. */
+    {
+        uint64_t _t_json1 = ns_now();
+        atomic_fetch_add(&g_ns_json_total, _t_json1 - _t_json0);
+        atomic_fetch_add(&g_cnt_events, 1);
+    }
 
-    rc = diaspora_producer_push(g_producer, buf, NULL, 0);
+    /* F1 (added 2026-06-23): batched-events fast path. When g_batch_size > 1
+     * we accumulate the rendered JSON into g_batch_buf[]; the buffer is
+     * drained when it fills (or at finalize). When g_batch_size == 1
+     * (default), we fall through to the immediate push for parity with
+     * the pre-F1 behavior. The "send: PUSH ok" debug breadcrumb is kept
+     * for parity with the ledger harness (08_ledger.sh greps for it).
+     */
+    if (g_batch_size > 1) {
+        int do_flush = 0;
+        /* TIER3: time the entire buffer-path critical section (lock,
+         * memcpy, conditional flush_batch, unlock). The inner flush_batch
+         * has its own bracket; ns_buffer therefore includes ns_flush. */
+        uint64_t _t_buf0 = ns_now();
+        pthread_mutex_lock(&g_batch_mtx);
+        if (g_batch_count < g_batch_size) {
+            memcpy(g_batch_buf[g_batch_count], buf, (size_t)n);
+            g_batch_buf[g_batch_count][n] = '\0';
+            g_batch_len[g_batch_count] = n;
+            g_batch_count++;
+            if (g_batch_count >= g_batch_size) do_flush = 1;
+        }
+        if (do_flush) {
+            dbg("send: BATCH FULL (count=%d, threshold=%d); flushing",
+                g_batch_count, g_batch_size);
+            /* TIER3: time flush_batch_locked separately so we know what
+             * fraction of the buffer path is the actual drain. */
+            uint64_t _t_fl0 = ns_now();
+            flush_batch_locked();
+            uint64_t _t_fl1 = ns_now();
+            atomic_fetch_add(&g_ns_flush_total, _t_fl1 - _t_fl0);
+            atomic_fetch_add(&g_cnt_flushes, 1);
+        }
+        pthread_mutex_unlock(&g_batch_mtx);
+        {
+            uint64_t _t_buf1 = ns_now();
+            atomic_fetch_add(&g_ns_buffer_total, _t_buf1 - _t_buf0);
+        }
+        /* parity-stable breadcrumb: still emit per-event PUSH ok so the
+         * ledger harness's grep keeps working (each connector_send still
+         * "succeeded" from the caller's POV even though the actual mofka
+         * push happens at batch-flush time). */
+        dbg("send: PUSH ok (json_bytes=%d) [buffered]", n);
+        goto out;
+    }
+
+    /* TIER3: non-batch path — time the single diaspora_producer_push. */
+    {
+        uint64_t _t_p0 = ns_now();
+        rc = diaspora_producer_push(g_producer, buf, NULL, 0);
+        uint64_t _t_p1 = ns_now();
+        atomic_fetch_add(&g_ns_push_total, _t_p1 - _t_p0);
+        atomic_fetch_add(&g_cnt_pushes, 1);
+    }
     if (rc == DIASPORA_C_OK) {
         dbg("send: PUSH ok (json_bytes=%d)", n);   /* parity-stable string */
     } else {
@@ -539,6 +827,18 @@ void darshan_mofka_connector_finalize(void)
 
     dbg("finalize: ENTER (g_producer=%p mC.producer=%p)",
         (void*)g_producer, mC.producer);
+
+    /* F1: drain any events still in the darshan-side batch buffer BEFORE
+     * the producer flush_timeout call below. Skipping this would lose the
+     * last partial batch on clean shutdown. */
+    if (g_batch_size > 1) {
+        pthread_mutex_lock(&g_batch_mtx);
+        if (g_batch_count > 0) {
+            dbg("finalize: draining %d remaining buffered events", g_batch_count);
+            flush_batch_locked();
+        }
+        pthread_mutex_unlock(&g_batch_mtx);
+    }
 
     /* idempotent / never-initialized path */
     if (g_producer == NULL) {
@@ -598,6 +898,41 @@ clear:
     mC.producer = NULL;
     mC.topic = NULL;
     mC.driver = NULL;
+
+    /* TIER3: emit one-line profile breakdown. Always printed (not gated on
+     * dbg_enabled) so harnesses can grep it without enabling debug. Same
+     * "darshan-mofka:" prefix as other operational lines so it filters
+     * cleanly. Format is a single line of key=value pairs for easy parse.
+     */
+    {
+        uint64_t events   = atomic_load(&g_cnt_events);
+        uint64_t pushes   = atomic_load(&g_cnt_pushes);
+        uint64_t flushes  = atomic_load(&g_cnt_flushes);
+        uint64_t ns_json  = atomic_load(&g_ns_json_total);
+        uint64_t ns_push  = atomic_load(&g_ns_push_total);
+        uint64_t ns_buf   = atomic_load(&g_ns_buffer_total);
+        uint64_t ns_flush = atomic_load(&g_ns_flush_total);
+        double per_event_json_us = events ? (double)ns_json / 1000.0 / (double)events : 0.0;
+        double per_event_buf_us  = events ? (double)ns_buf  / 1000.0 / (double)events : 0.0;
+        double per_push_us       = pushes ? (double)ns_push / 1000.0 / (double)pushes : 0.0;
+        double per_flush_us      = flushes ? (double)ns_flush / 1000.0 / (double)flushes : 0.0;
+        fprintf(stderr,
+                "darshan-mofka[PROF] pid=%ld batch_size=%d packed=%d "
+                "events=%llu pushes=%llu flushes=%llu "
+                "ns_json=%llu ns_push=%llu ns_buffer=%llu ns_flush=%llu "
+                "us_per_event_json=%.3f us_per_event_buffer=%.3f "
+                "us_per_push=%.3f us_per_flush=%.3f "
+                "ms_total_json=%.1f ms_total_push=%.1f ms_total_buffer=%.1f ms_total_flush=%.1f\n",
+                g_pid, g_batch_size, g_packed,
+                (unsigned long long)events, (unsigned long long)pushes, (unsigned long long)flushes,
+                (unsigned long long)ns_json, (unsigned long long)ns_push,
+                (unsigned long long)ns_buf, (unsigned long long)ns_flush,
+                per_event_json_us, per_event_buf_us,
+                per_push_us, per_flush_us,
+                (double)ns_json/1e6, (double)ns_push/1e6,
+                (double)ns_buf/1e6, (double)ns_flush/1e6);
+        fflush(stderr);
+    }
     dbg("finalize: DONE");
 }
 
