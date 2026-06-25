@@ -939,6 +939,25 @@ clear:
                 (double)atomic_load(&g_ns_destroys[2])/1e6);
         fflush(stderr);
     }
+    /* EX-2026-06-25 T_MOFKA_FINALIZE_END marker: monotonic timestamp at
+     * the exact moment mofka's connector_finalize is returning. Compared
+     * with darshan-core's T_FINALIZE_END (printed in serial_finalize after
+     * darshan_core_shutdown returns), the delta is the cost of all the
+     * post-mofka work inside darshan-core's shutdown (mostly the .darshan
+     * log write). The delta between T_MOFKA_FINALIZE_END and bash's
+     * wall_end is the cost of libmofka/libthallium/libargobots/libmercury
+     * static C++ destructors at process exit -- the elusive ~3.6s blind
+     * spot from L4.33/L4.34. */
+    {
+        struct timespec _ts;
+        clock_gettime(CLOCK_MONOTONIC, &_ts);
+        long long _t_ns = (long long)_ts.tv_sec * 1000000000LL
+                        + (long long)_ts.tv_nsec;
+        fprintf(stderr,
+                "darshan-mofka[T_FINALIZE_END] pid=%ld t_wall_ns=%lld\n",
+                g_pid ? g_pid : (long)getpid(), _t_ns);
+        fflush(stderr);
+    }
     dbg("finalize: DONE");
 }
 

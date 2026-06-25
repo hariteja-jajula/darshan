@@ -13,12 +13,28 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <time.h>
+#include <unistd.h>
 #ifdef HAVE_MPI
 #include <mpi.h>
 #endif
 
 #include "darshan.h"
 #include "darshan-dynamic.h"
+
+/* EX-2026-06-25 finalize-end markers (L4.x): print monotonic timestamps
+ * at darshan-core finalize boundaries so we can bracket how much wall
+ * time is spent AFTER our last instruction. Subtracting this from bash's
+ * wall_end measurement gives the cost of libmofka/libthallium static
+ * destructors + kernel reap. Always printed when DARSHAN_ENABLE_NONMPI=1
+ * (the only path that calls serial_finalize). Match darshan-mofka's
+ * stderr prefix style for grep-ability. */
+static inline long long _darshan_now_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long long)ts.tv_sec * 1000000000LL + (long long)ts.tv_nsec;
+}
 
 #ifdef HAVE_MPI
 DARSHAN_FORWARD_DECL(PMPI_Finalize, int, ());
@@ -109,8 +125,34 @@ __attribute__((constructor)) void serial_init(void)
 __attribute__((destructor)) void serial_finalize(void)
 {
     char *no_mpi = getenv("DARSHAN_ENABLE_NONMPI");
-    if (no_mpi)
-        darshan_core_shutdown(1);
+    if (!no_mpi) return;
+
+    /* Bracket the entire darshan-core finalize work with monotonic
+     * timestamps. T_FINALIZE_BEGIN fires at the START of serial_finalize;
+     * T_FINALIZE_END fires at the END, immediately before this function
+     * returns. The delta is the cost of darshan_core_shutdown (which
+     * itself calls darshan_mofka_connector_finalize early on).
+     *
+     * After T_FINALIZE_END, control returns to the C runtime which then
+     * runs C++ static destructors for all dynamically-loaded shared
+     * objects (libmofka, libthallium, libargobots, libmercury, libfabric,
+     * ...). Compare T_FINALIZE_END to bash's wall_end timestamp to get
+     * the cost of those static dtors. */
+    long long t_begin_ns = _darshan_now_ns();
+    fprintf(stderr,
+            "darshan-core[T_FINALIZE_BEGIN] pid=%ld t_wall_ns=%lld\n",
+            (long)getpid(), t_begin_ns);
+    fflush(stderr);
+
+    darshan_core_shutdown(1);
+
+    long long t_end_ns = _darshan_now_ns();
+    fprintf(stderr,
+            "darshan-core[T_FINALIZE_END] pid=%ld t_wall_ns=%lld "
+            "delta_ms=%.3f\n",
+            (long)getpid(), t_end_ns,
+            (double)(t_end_ns - t_begin_ns) / 1.0e6);
+    fflush(stderr);
     return;
 }
 #endif
