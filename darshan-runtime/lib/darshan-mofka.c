@@ -217,6 +217,8 @@ static atomic_uint_least64_t g_ns_flush_total   = 0;
 static atomic_uint_least64_t g_cnt_events       = 0;
 static atomic_uint_least64_t g_cnt_pushes       = 0;
 static atomic_uint_least64_t g_cnt_flushes      = 0;
+/* EX-2026-06-24 destroy-attribution (L4.25): three post-flush destroy times */
+static atomic_uint_least64_t g_ns_destroys[3]   = {0,0,0}; /* prod, topic, driver */
 
 static inline uint64_t ns_now(void)
 {
@@ -870,9 +872,9 @@ void darshan_mofka_connector_finalize(void)
         /* clean teardown via the bindings' destructors. No C++ static-
          * destruction footgun here -- explicit C destroys are trivially
          * ordered (one of the structural wins of the retarget). */
-        diaspora_producer_destroy(g_producer);
-        diaspora_topic_destroy(g_topic);
-        diaspora_driver_destroy(g_driver);
+        { uint64_t _t=ns_now(); diaspora_producer_destroy(g_producer); atomic_fetch_add(&g_ns_destroys[0], ns_now()-_t); }
+        { uint64_t _t=ns_now(); diaspora_topic_destroy(g_topic);       atomic_fetch_add(&g_ns_destroys[1], ns_now()-_t); }
+        { uint64_t _t=ns_now(); diaspora_driver_destroy(g_driver);     atomic_fetch_add(&g_ns_destroys[2], ns_now()-_t); }
         goto clear;
     }
 
@@ -922,7 +924,8 @@ clear:
                 "ns_json=%llu ns_push=%llu ns_buffer=%llu ns_flush=%llu "
                 "us_per_event_json=%.3f us_per_event_buffer=%.3f "
                 "us_per_push=%.3f us_per_flush=%.3f "
-                "ms_total_json=%.1f ms_total_push=%.1f ms_total_buffer=%.1f ms_total_flush=%.1f\n",
+                "ms_total_json=%.1f ms_total_push=%.1f ms_total_buffer=%.1f ms_total_flush=%.1f "
+                "ms_prod_destroy=%.1f ms_topic_destroy=%.1f ms_driver_destroy=%.1f\n",
                 g_pid, g_batch_size, g_packed,
                 (unsigned long long)events, (unsigned long long)pushes, (unsigned long long)flushes,
                 (unsigned long long)ns_json, (unsigned long long)ns_push,
@@ -930,7 +933,10 @@ clear:
                 per_event_json_us, per_event_buf_us,
                 per_push_us, per_flush_us,
                 (double)ns_json/1e6, (double)ns_push/1e6,
-                (double)ns_buf/1e6, (double)ns_flush/1e6);
+                (double)ns_buf/1e6, (double)ns_flush/1e6,
+                (double)atomic_load(&g_ns_destroys[0])/1e6,
+                (double)atomic_load(&g_ns_destroys[1])/1e6,
+                (double)atomic_load(&g_ns_destroys[2])/1e6);
         fflush(stderr);
     }
     dbg("finalize: DONE");
