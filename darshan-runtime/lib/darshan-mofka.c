@@ -848,6 +848,33 @@ void darshan_mofka_connector_finalize(void)
         goto clear;
     }
 
+    /* EX-2026-06-25 SKIP_FINALIZE: LDMS-style fire-and-forget at exit.
+     *
+     * By default (no env var set), we drain the darshan-side accumulator
+     * above (so the last partial batch IS sent to the broker), emit PROF,
+     * and SKIP the synchronous producer flush_timeout + 3 destroys. The
+     * broker continues processing in-flight pushes on its own; the OS
+     * reaps producer-side handles at exit. This matches LDMS semantics
+     * (~0 explicit teardown cost; ~3.6s libmofka static dtors at dlclose
+     * remain, unaffected).
+     *
+     * Set DARSHAN_MOFKA_SYNC_FINALIZE=1 to opt INTO the legacy synchronous
+     * behavior: producer waits for all in-flight ACKs (bounded by
+     * DARSHAN_MOFKA_FLUSH_TIMEOUT_SEC) then explicitly destroys producer/
+     * topic/driver handles. Use when you need exit-time delivery
+     * confirmation. Cost: ~2.6s additional teardown wall.
+     *
+     * Trade-off: in fire-and-forget mode, if the broker dies between
+     * producer-exit and broker-drain completion, the last few events in
+     * flight may not reach mongo. The .darshan log file is written
+     * regardless of this setting (the two are independent paths).
+     */
+    if (getenv("DARSHAN_MOFKA_SYNC_FINALIZE") == NULL) {
+        dbg("finalize: SKIP sync (default fire-and-forget; "
+            "set DARSHAN_MOFKA_SYNC_FINALIZE=1 to wait)");
+        goto leak;
+    }
+
     /* breaker tripped: broker already known-dead; flushing would burn
      * the full timeout for nothing. Leak deliberately. */
     if (atomic_load(&g_push_broken)) {

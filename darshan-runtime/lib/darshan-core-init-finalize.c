@@ -15,6 +15,7 @@
 #include <stdlib.h>
 #include <time.h>
 #include <unistd.h>
+#include <sys/syscall.h>
 #ifdef HAVE_MPI
 #include <mpi.h>
 #endif
@@ -153,6 +154,44 @@ __attribute__((destructor)) void serial_finalize(void)
             (long)getpid(), t_end_ns,
             (double)(t_end_ns - t_begin_ns) / 1.0e6);
     fflush(stderr);
+
+    /* EX-2026-06-25 DARSHAN_MOFKA_FAST_EXIT: kill the ~3.6s of libmofka
+     * static C++ destructors that fire AFTER serial_finalize returns
+     * during __cxa_finalize. By calling _exit(0) here, we bypass:
+     *   - libstdc++ atexit chain
+     *   - libmofka / libthallium / libargobots / libmercury / libfabric
+     *     static C++ destructors
+     *   - libc's exit-time cleanup
+     * The kernel immediately reaps all process resources via exit_group.
+     *
+     * Safety: PROF has already been flushed (above). The .darshan log
+     * has been written (inside darshan_core_shutdown). Mongo events
+     * already in-flight to broker will complete on the broker side
+     * independently of producer exit.
+     *
+     * This is the strongest possible "fire-and-forget" semantic: matches
+     * LDMS's "no shutdown function at all" pattern. The 3.6s of libmofka
+     * static dtors that L4.33 attributed by elimination is now provably
+     * skipped (process is gone before they could fire).
+     *
+     * Opt-in: set DARSHAN_MOFKA_FAST_EXIT=1. Defaults to OFF so that
+     * any downstream code expecting normal exit semantics keeps working. */
+    if (getenv("DARSHAN_MOFKA_FAST_EXIT") != NULL) {
+        long long t_fastexit_ns = _darshan_now_ns();
+        fprintf(stderr,
+                "darshan-core[T_FAST_EXIT] pid=%ld t_wall_ns=%lld "
+                "(syscall exit_group bypassing C++ static dtors)\n",
+                (long)getpid(), t_fastexit_ns);
+        fflush(stderr);
+        fflush(stdout);
+        /* Use raw exit_group syscall to bypass any libc/libdarshan
+         * exit wrapping (the __DARSHAN_ENABLE_EXIT_WRAPPER build option
+         * would intercept _exit() and re-enter darshan_core_shutdown,
+         * causing a loop). */
+        syscall(SYS_exit_group, 0);
+        /* Should never reach here, but in case: */
+        _exit(0);
+    }
     return;
 }
 #endif
