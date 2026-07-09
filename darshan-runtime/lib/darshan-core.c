@@ -47,6 +47,7 @@
 #include "darshan-dynamic.h"
 #include "darshan-dxt.h"
 #include "darshan-ldms.h"
+#include "darshan-mofka.h"
 
 #ifdef DARSHAN_LUSTRE
 #include <lustre/lustre_user.h>
@@ -350,6 +351,11 @@ void darshan_core_initialize(int argc, char **argv)
         /* check if user turns on LDMS -- pass init_core to darshan-ldms connector initialization*/
         if (getenv("DARSHAN_LDMS_ENABLE"))
             darshan_ldms_connector_initialize(init_core);
+#endif
+
+#ifdef HAVE_MOFKA
+        if (getenv("DARSHAN_MOFKA_ENABLE"))
+            darshan_mofka_connector_initialize(init_core);
 #endif
 
         /* if darshan was successfully initialized, set the global pointer
@@ -763,6 +769,9 @@ cleanup:
     for(i = 0; i < DARSHAN_KNOWN_MODULE_COUNT; i++)
         if(final_core->mod_array[i])
             final_core->mod_array[i]->mod_funcs.mod_cleanup_func();
+#ifdef HAVE_MOFKA
+    darshan_mofka_connector_finalize();
+#endif
     darshan_core_cleanup(final_core);
 #ifdef HAVE_MPI
     if(using_mpi)

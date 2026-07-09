@@ -60,7 +60,8 @@ bin_PROGRAMS = darshan-analyzer \
                darshan-diff \
                darshan-parser \
                darshan-dxt-parser \
-               darshan-merge
+               darshan-merge \
+               darshan-reconstruct
 
 noinst_PROGRAMS = jenkins-hash-gen
 
@@ -72,6 +73,9 @@ darshan_analyzer_LDADD = libdarshan-util.la
 
 darshan_convert_SOURCES = darshan-convert.c lookup3.c
 darshan_convert_LDADD = libdarshan-util.la
+
+darshan_reconstruct_SOURCES = darshan-reconstruct.c
+darshan_reconstruct_LDADD = libdarshan-util.la
 
 darshan_diff_SOURCES = darshan-diff.c
 darshan_diff_LDADD = libdarshan-util.la

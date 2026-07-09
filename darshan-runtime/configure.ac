@@ -613,6 +613,23 @@ if test "x$enable_darshan_runtime" = xyes ; then
       CHECK_LDMS
    fi
 
+   # Mofka streaming via the diaspora-c bindings (disabled unless
+   # --with-diaspora-c is given). HAVE_MOFKA is the output macro the
+   # connector + call sites guard on.
+   DARSHAN_CHECK_DIASPORA_C
+   if test "x$have_diaspora_c" = "xyes" ; then
+      enable_mofka_mod=yes
+      with_mofka="$with_diaspora_c"
+      MOFKA_LIBS="$DIASPORA_C_LIBS"
+      MOFKA_CFLAGS="$DIASPORA_C_CFLAGS"
+   else
+      enable_mofka_mod=no
+      MOFKA_LIBS=""
+      MOFKA_CFLAGS=""
+   fi
+   AC_SUBST(MOFKA_LIBS)
+   AC_SUBST(MOFKA_CFLAGS)
+
    dnl sanity check some config parameters
    if test "x$GOT_LOG_PATH" != xyes ; then
       AC_MSG_ERROR(must provide --with-log-path=<path> _or_ --with-log-path-by-env=<variable list> argument to configure.)
@@ -939,6 +956,7 @@ else
    enable_lustre_mod=no
    enable_mdhim_mod=no
    enable_ldms_mod=no
+   enable_mofka_mod=no
    with_log_path=
    with_jobid_env=
    have_mpi_io_large_count_apis=no
@@ -968,6 +986,7 @@ AC_SUBST(ENABLE_BGQ_MOD, ["$enable_bgq_mod"])
 AC_SUBST(ENABLE_LUSTRE_MOD, ["$enable_lustre_mod"])
 AC_SUBST(ENABLE_MDHIM_MOD, ["$enable_mdhim_mod"])
 AC_SUBST(ENABLE_LDMS_MOD, ["$enable_ldms_mod"])
+AC_SUBST(ENABLE_MOFKA_MOD, ["$enable_mofka_mod"])
 AC_SUBST(ENABLE_RDTSCP_NUM, ["$rdtscp_num"])
 AC_SUBST(ENABLE_EXIT_WRAPPER, ["$enable_exit_wrapper"])
 AC_SUBST(ZLIB_HOME, ["$ZLIB_HOME"])
@@ -981,6 +1000,7 @@ AC_SUBST(HDF5_PATH, ["$with_hdf5"])
 AC_SUBST(PNETCDF_PATH, ["$with_pnetcdf"])
 AC_SUBST(DAOS_PATH, ["$with_daos"])
 AC_SUBST(LDMS_PATH, ["$LDMS_HOME"])
+AC_SUBST(MOFKA_PATH, ["$with_mofka"])
 AC_SUBST(HAVE_OPEN_MPI, ["$is_ompi"])
 AC_SUBST(OMPI_GE_5_0_6, ["$ompi_ge_5_0_6"])
 
@@ -1079,6 +1099,7 @@ if test "x$enable_darshan_runtime" = xyes ; then
            MDHIM         module support  - $enable_mdhim_mod
            HEATMAP       module support  - $enable_heatmap_mod
            LDMS          runtime module  - $enable_ldms_mod
+           Mofka         runtime module  - $enable_mofka_mod
            Memory alignment in bytes     - $with_mem_align
            Log file env variables        - $__log_path_by_env
            Location of Darshan log files - $__log_path

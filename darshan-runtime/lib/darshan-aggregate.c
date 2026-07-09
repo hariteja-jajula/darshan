@@ -1,0 +1,277 @@
+/*
+ * (C) 2026 The University of Chicago
+ *
+ * See COPYRIGHT in top-level directory.
+ */
+
+#ifdef HAVE_CONFIG_H
+# include <darshan-runtime-config.h>
+#endif
+
+#define _XOPEN_SOURCE 500
+#define _GNU_SOURCE
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+#include <time.h>
+#include <unistd.h>
+#include "darshan-mofka.h"
+#include "darshan.h"
+
+#ifdef HAVE_MOFKA
+
+#include <stdatomic.h>
+#include <diaspora/diaspora_c.h>
+
+struct darshanMofkaConnector mC = {
+    .mofka_lib = 1,
+};
+
+static diaspora_driver_t*   g_driver;
+static diaspora_topic_t*    g_topic;
+static diaspora_producer_t* g_producer;
+
+static atomic_ullong g_seq;
+static __thread int  g_in_send;
+
+static char    g_hostname[256];
+static long    g_pid;
+static int64_t g_uid   = -1;
+static int64_t g_jobid = -1;
+static double  g_t0_epoch;
+
+#define MOFKA_JSON_BUF 2048
+
+static uint64_t now_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+static void mofka_took(const char* fn, uint64_t t0)
+{
+    if (getenv("DARSHAN_MOFKA_TIMING"))
+        fprintf(stderr, "darshan-mofka[timing] %s %.3f us\n", fn, (now_ns() - t0) / 1e3);
+}
+
+static void json_escape_into(char* dst, size_t dstsz, const char* src)
+{
+    size_t o = 0;
+    if (dstsz == 0) return;
+    if (src == NULL) src = "unknown";
+    for (; *src && o + 2 < dstsz; src++) {
+        unsigned char c = (unsigned char)*src;
+        if (c == '"' || c == '\\') { dst[o++] = '\\'; dst[o++] = (char)c; }
+        else if (c < 0x20)         { dst[o++] = '?'; }
+        else                       { dst[o++] = (char)c; }
+    }
+    dst[o] = '\0';
+}
+
+static int module_enabled_for(const char* mod)
+{
+    if (mod == NULL) return 0;
+    if (strcmp(mod, "POSIX") == 0)  return mC.posix_enable_mofka;
+    if (strcmp(mod, "STDIO") == 0)  return mC.stdio_enable_mofka;
+    if (strcmp(mod, "MPIIO") == 0 ||
+        strcmp(mod, "MPI-IO") == 0) return mC.mpiio_enable_mofka;
+    if (strcmp(mod, "H5F") == 0 ||
+        strcmp(mod, "H5D") == 0 ||
+        strcmp(mod, "HDF5") == 0)   return mC.hdf5_enable_mofka;
+    return 0;
+}
+
+void darshan_mofka_connector_initialize(struct darshan_core_runtime* init_core)
+{
+    const char* group_file;
+    const char* topic_name;
+    char opts[1200];
+    char gf_esc[1024];
+    char pname[64];
+    struct timespec ts;
+    uint64_t t0 = now_ns();
+
+    g_pid = (long)getpid();
+
+    if (gethostname(g_hostname, sizeof(g_hostname)) != 0)
+        snprintf(g_hostname, sizeof(g_hostname), "unknown");
+    g_hostname[sizeof(g_hostname) - 1] = '\0';
+
+    if (clock_gettime(CLOCK_REALTIME, &ts) == 0)
+        g_t0_epoch = (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+
+    if (init_core && init_core->log_job_p) {
+        g_uid   = (int64_t)init_core->log_job_p->uid;
+        g_jobid = (int64_t)init_core->log_job_p->jobid;
+    }
+
+    group_file = getenv("DARSHAN_MOFKA_GROUP_FILE");
+    topic_name = getenv("DARSHAN_MOFKA_TOPIC");
+    if (topic_name == NULL || *topic_name == '\0') topic_name = "darshan";
+
+    if (group_file == NULL || *group_file == '\0') {
+        fprintf(stderr, "darshan-mofka: DARSHAN_MOFKA_GROUP_FILE not set; "
+                "records will not be streamed.\n");
+        return;
+    }
+
+    json_escape_into(gf_esc, sizeof(gf_esc), group_file);
+    snprintf(opts, sizeof(opts), "{\"group_file\":\"%s\"}", gf_esc);
+
+    g_driver = diaspora_driver_create("mofka", opts);
+    if (g_driver == NULL) {
+        fprintf(stderr, "darshan-mofka: driver_create failed (%s)\n",
+                diaspora_c_last_error());
+        return;
+    }
+
+    g_topic = diaspora_topic_open(g_driver, topic_name);
+    if (g_topic == NULL) {
+        fprintf(stderr, "darshan-mofka: topic_open('%s') failed (%s)\n",
+                topic_name, diaspora_c_last_error());
+        diaspora_driver_destroy(g_driver); g_driver = NULL;
+        return;
+    }
+
+    snprintf(pname, sizeof(pname), "darshan-%ld", g_pid);
+    g_producer = diaspora_producer_create(g_topic, pname, 0, 0,
+                                          DIASPORA_C_ORDERING_LOOSE);
+    if (g_producer == NULL) {
+        fprintf(stderr, "darshan-mofka: producer_create failed (%s)\n",
+                diaspora_c_last_error());
+        diaspora_topic_destroy(g_topic);   g_topic = NULL;
+        diaspora_driver_destroy(g_driver); g_driver = NULL;
+        return;
+    }
+
+    mC.posix_enable_mofka = (getenv("DARSHAN_MOFKA_ENABLE_POSIX") != NULL);
+    mC.stdio_enable_mofka = (getenv("DARSHAN_MOFKA_ENABLE_STDIO") != NULL);
+    mC.mpiio_enable_mofka = (getenv("DARSHAN_MOFKA_ENABLE_MPIIO") != NULL);
+    mC.hdf5_enable_mofka  = (getenv("DARSHAN_MOFKA_ENABLE_HDF5")  != NULL);
+
+    if (getenv("DARSHAN_MOFKA_VERBOSE"))
+        fprintf(stderr, "darshan-mofka: producer connected to topic '%s'\n",
+                topic_name);
+
+    mofka_took("initialize", t0);
+}
+
+void darshan_mofka_connector_send(uint64_t record_id, int64_t rank,
+                                  int64_t record_count, char* rwo,
+                                  int64_t offset, int64_t length,
+                                  int64_t max_byte, int64_t rw_switch,
+                                  int64_t flushes,
+                                  double start_time, double end_time,
+                                  double total_time,
+                                  char* mod_name, char* data_type)
+{
+    char buf[MOFKA_JSON_BUF];
+    char file_esc[1024];
+    char host_esc[300];
+    const char* file_path;
+    unsigned long long seq;
+    uint64_t t0;
+    int n;
+
+    if (g_in_send) return;
+    g_in_send = 1;
+    t0 = now_ns();
+
+    if (g_producer == NULL) goto out;
+    if (!module_enabled_for(mod_name)) goto out;
+
+    file_path = (const char*)darshan_core_lookup_record_name(record_id);
+    json_escape_into(file_esc, sizeof(file_esc), file_path);
+    json_escape_into(host_esc, sizeof(host_esc), g_hostname);
+    seq = (unsigned long long)atomic_fetch_add(&g_seq, 1);
+
+    n = snprintf(buf, sizeof(buf),
+        "{\"type\":\"task\","
+        "\"activity_id\":\"darshan_%s\","
+        "\"task_id\":\"darshan-%016llx-%ld-%llu\","
+        "\"schema\":\"darshan_runtime\",\"schema_version\":2,"
+        "\"module\":\"%s\",\"event_type\":\"%s\",\"op\":\"%s\","
+        "\"record_id\":\"%016llx\",\"file\":\"%s\","
+        "\"hostname\":\"%s\",\"pid\":%ld,\"uid\":%lld,\"job_id\":%lld,"
+        "\"rank\":%lld,\"seq\":%llu,\"t0_epoch\":%.6f,"
+        "\"cnt\":%lld,\"off\":%lld,\"len\":%lld,\"max_byte\":%lld,"
+        "\"switches\":%lld,\"flushes\":%lld,"
+        "\"started_at\":%.6f,\"ended_at\":%.6f,\"dur\":%.6f,\"total\":%.6f}",
+        mod_name ? mod_name : "?",
+        (unsigned long long)record_id, g_pid, seq,
+        mod_name ? mod_name : "?",
+        data_type ? data_type : "?",
+        rwo ? rwo : "?",
+        (unsigned long long)record_id, file_esc,
+        host_esc, g_pid, (long long)g_uid, (long long)g_jobid,
+        (long long)rank, seq, g_t0_epoch,
+        (long long)record_count, (long long)offset, (long long)length,
+        (long long)max_byte, (long long)rw_switch, (long long)flushes,
+        start_time, end_time, end_time - start_time, total_time);
+
+    if (n < 0 || (size_t)n >= sizeof(buf)) goto out;
+
+    if (diaspora_producer_push(g_producer, buf, NULL, 0) != DIASPORA_C_OK)
+        fprintf(stderr, "darshan-mofka: push failed (%s)\n",
+                diaspora_c_last_error());
+
+out:
+    mofka_took("send", t0);
+    g_in_send = 0;
+}
+
+void darshan_mofka_connector_finalize(void)
+{
+    int rc;
+    uint64_t t0;
+
+    if (g_producer == NULL) goto clear;
+
+    t0 = now_ns();
+    rc = diaspora_producer_flush_timeout(g_producer, 5000);
+    if (rc == DIASPORA_C_TIMEOUT)
+        fprintf(stderr, "darshan-mofka: flush timed out; leaking handles.\n");
+    else if (rc == DIASPORA_C_ERR)
+        fprintf(stderr, "darshan-mofka: flush error (%s)\n",
+                diaspora_c_last_error());
+    mofka_took("finalize", t0);
+
+clear:
+    g_producer = NULL;
+    g_topic = NULL;
+    g_driver = NULL;
+}
+
+#else
+
+struct darshanMofkaConnector mC = {
+    .mofka_lib = 0,
+};
+
+void darshan_mofka_connector_initialize(struct darshan_core_runtime* init_core)
+{
+    (void)init_core;
+}
+
+void darshan_mofka_connector_send(uint64_t record_id, int64_t rank,
+                                  int64_t record_count, char* rwo,
+                                  int64_t offset, int64_t length,
+                                  int64_t max_byte, int64_t rw_switch,
+                                  int64_t flushes,
+                                  double start_time, double end_time,
+                                  double total_time,
+                                  char* mod_name, char* data_type)
+{
+    (void)record_id; (void)rank;       (void)record_count; (void)rwo;
+    (void)offset;    (void)length;     (void)max_byte;     (void)rw_switch;
+    (void)flushes;   (void)start_time; (void)end_time;     (void)total_time;
+    (void)mod_name;  (void)data_type;
+}
+
+void darshan_mofka_connector_finalize(void)
+{
+}
+
+#endif /* HAVE_MOFKA */
