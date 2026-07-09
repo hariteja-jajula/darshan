@@ -18,6 +18,7 @@ C_SRCS = darshan-core-init-finalize.c \
          darshan-common.c \
          darshan-config.c \
          darshan-ldms.c \
+         darshan-mofka.c \
          lookup3.c \
          lookup8.c
 
@@ -109,11 +110,17 @@ libdarshan_la_CPPFLAGS += -I$(LDMS_HOME)/include
 libdarshan_la_LDFLAGS = -L$(LDMS_HOME)/lib -Wl,-rpath=$(LDMS_HOME)/lib
 endif
 
+if HAVE_MOFKA
+libdarshan_la_LIBADD += $(MOFKA_LIBS)
+libdarshan_la_CPPFLAGS += $(MOFKA_CFLAGS)
+endif
+
 H_SRCS = darshan-common.h \
          darshan.h \
          darshan-config.h \
          darshan-dxt.h \
          darshan-ldms.h \
+         darshan-mofka.h \
          uthash.h \
          darshan-dynamic.h \
          utlist.h \
@@ -125,6 +132,7 @@ EXTRA_DIST = $(H_SRCS) \
              darshan-stdio.c \
              darshan-dxt.c \
              darshan-ldms.c \
+             darshan-mofka.c \
              darshan-mpiio.c \
              darshan-pnetcdf.c \
              darshan-pnetcdf-api.m4 \
