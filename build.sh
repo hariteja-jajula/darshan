@@ -43,8 +43,10 @@ if [ -f "$BUILD/config.status" ]; then
 fi
 mkdir -p "$BUILD" "$PREFIX"
 
-# bootstrap autotools only if the generated configure is missing (exec-bit-proof)
-[ -f "$SRC/configure" ] || ( cd "$SRC" && sh ./prepare.sh )
+# bootstrap autotools only if the generated configure is missing. darshan-runtime
+# is its own autotools package (no prepare.sh of its own; the repo-root prepare.sh
+# is just `autoreconf -fi`), so bootstrap it directly here.
+[ -f "$SRC/configure" ] || ( cd "$SRC" && autoreconf -fi )
 
 # defeat maintainer-mode regeneration: bump generated files >= their sources so
 # `make` doesn't try to re-run aclocal/automake (dies if the local automake
