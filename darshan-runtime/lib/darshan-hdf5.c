@@ -27,6 +27,7 @@
 #include "darshan.h"
 #include "darshan-dynamic.h"
 #include "darshan-ldms.h"
+#include "darshan-mofka.h"
 
 #include <hdf5.h>
 
@@ -190,6 +191,7 @@ static int my_rank = -1;
     if(dC.ldms_lib)\
         if(dC.hdf5_enable_ldms)\
             darshan_ldms_connector_send(__rec_ref->file_rec->base_rec.id, __rec_ref->file_rec->base_rec.rank,__rec_ref->file_rec->counters[H5F_OPENS], "open", -1, -1, -1, -1, __rec_ref->file_rec->counters[H5F_FLUSHES], __tm1, __tm2, __rec_ref->file_rec->fcounters[H5F_F_META_TIME], "H5F", "MET");\
+    DARSHAN_MOFKA_SEND(__rec_ref->file_rec->base_rec.id, __rec_ref->file_rec->base_rec.rank, __rec_ref->file_rec->counters[H5F_OPENS], "open", -1, -1, -1, -1, __rec_ref->file_rec->counters[H5F_FLUSHES], __tm1, __tm2, __rec_ref->file_rec->fcounters[H5F_F_META_TIME], "H5F", "MET", (const void*)__rec_ref->file_rec, sizeof(*__rec_ref->file_rec));\
 } while(0)
 
 hid_t DARSHAN_DECL(H5Fcreate)(const char *filename, unsigned flags,
@@ -444,6 +446,7 @@ herr_t DARSHAN_DECL(H5Fclose)(hid_t file_id)
             DARSHAN_TIMER_INC_NO_OVERLAP(
                 rec_ref->file_rec->fcounters[H5F_F_META_TIME],
                 tm1, tm2, rec_ref->last_meta_end);
+            DARSHAN_MOFKA_SEND(rec_ref->file_rec->base_rec.id, rec_ref->file_rec->base_rec.rank, rec_ref->file_rec->counters[H5F_OPENS], "close", -1, -1, -1, -1, rec_ref->file_rec->counters[H5F_FLUSHES], tm1, tm2, rec_ref->file_rec->fcounters[H5F_F_META_TIME], "H5F", "MOD", (const void*)rec_ref->file_rec, sizeof(*rec_ref->file_rec));
             darshan_delete_record_ref(&(hdf5_file_runtime->hid_hash),
                 &file_id, sizeof(hid_t));
 
@@ -548,6 +551,7 @@ herr_t DARSHAN_DECL(H5Fclose)(hid_t file_id)
     if(dC.ldms_lib)\
         if(dC.hdf5_enable_ldms)\
             darshan_ldms_connector_send(__rec_ref->dataset_rec->base_rec.id, __rec_ref->dataset_rec->base_rec.rank,__rec_ref->dataset_rec->counters[H5D_OPENS], "open", -1, -1, -1, -1, __rec_ref->dataset_rec->counters[H5D_FLUSHES], __tm1, __tm2, __rec_ref->dataset_rec->fcounters[H5D_F_META_TIME], "H5D", "MET");\
+    DARSHAN_MOFKA_SEND(__rec_ref->dataset_rec->base_rec.id, __rec_ref->dataset_rec->base_rec.rank, __rec_ref->dataset_rec->counters[H5D_OPENS], "open", -1, -1, -1, -1, __rec_ref->dataset_rec->counters[H5D_FLUSHES], __tm1, __tm2, __rec_ref->dataset_rec->fcounters[H5D_F_META_TIME], "H5D", "MET", (const void*)__rec_ref->dataset_rec, sizeof(*__rec_ref->dataset_rec));\
 } while(0)
 
 hid_t DARSHAN_DECL(H5Dcreate1)(hid_t loc_id, const char *name, hid_t type_id, hid_t space_id, hid_t dcpl_id)
@@ -798,6 +802,7 @@ herr_t DARSHAN_DECL(H5Dread)(hid_t dataset_id, hid_t mem_type_id, hid_t mem_spac
             DARSHAN_TIMER_INC_NO_OVERLAP(
                 rec_ref->dataset_rec->fcounters[H5D_F_READ_TIME],
                 tm1, tm2, rec_ref->last_read_end);
+            DARSHAN_MOFKA_SEND(rec_ref->dataset_rec->base_rec.id, rec_ref->dataset_rec->base_rec.rank, rec_ref->dataset_rec->counters[H5D_READS], "read", -1, rec_ref->dataset_rec->counters[H5D_MAX_READ_TIME_SIZE], -1, rec_ref->dataset_rec->counters[H5D_RW_SWITCHES], rec_ref->dataset_rec->counters[H5D_FLUSHES], tm1, tm2, rec_ref->dataset_rec->fcounters[H5D_F_READ_TIME], "H5D", "MOD", (const void*)rec_ref->dataset_rec, sizeof(*rec_ref->dataset_rec));
 
 #ifdef HAVE_LDMS
             /* LDMS to publish runtime h5d tracing information to daemon*/
@@ -929,6 +934,7 @@ herr_t DARSHAN_DECL(H5Dwrite)(hid_t dataset_id, hid_t mem_type_id, hid_t mem_spa
             DARSHAN_TIMER_INC_NO_OVERLAP(
                 rec_ref->dataset_rec->fcounters[H5D_F_WRITE_TIME],
                 tm1, tm2, rec_ref->last_write_end);
+            DARSHAN_MOFKA_SEND(rec_ref->dataset_rec->base_rec.id, rec_ref->dataset_rec->base_rec.rank, rec_ref->dataset_rec->counters[H5D_WRITES], "write", -1, rec_ref->dataset_rec->counters[H5D_MAX_WRITE_TIME_SIZE], -1, rec_ref->dataset_rec->counters[H5D_RW_SWITCHES], rec_ref->dataset_rec->counters[H5D_FLUSHES], tm1, tm2, rec_ref->dataset_rec->fcounters[H5D_F_WRITE_TIME], "H5D", "MOD", (const void*)rec_ref->dataset_rec, sizeof(*rec_ref->dataset_rec));
 
 #ifdef HAVE_LDMS
             /* LDMS to publish runtime h5d tracing information to daemon*/
@@ -1010,6 +1016,7 @@ herr_t DARSHAN_DECL(H5Dclose)(hid_t dataset_id)
             rec_ref->dataset_rec->fcounters[H5D_F_CLOSE_END_TIMESTAMP] = tm2;
             DARSHAN_TIMER_INC_NO_OVERLAP(rec_ref->dataset_rec->fcounters[H5D_F_META_TIME],
                 tm1, tm2, rec_ref->last_meta_end);
+            DARSHAN_MOFKA_SEND(rec_ref->dataset_rec->base_rec.id, rec_ref->dataset_rec->base_rec.rank, rec_ref->dataset_rec->counters[H5D_OPENS], "close", -1, -1, -1, -1, rec_ref->dataset_rec->counters[H5D_FLUSHES], tm1, tm2, rec_ref->dataset_rec->fcounters[H5D_F_META_TIME], "H5D", "MOD", (const void*)rec_ref->dataset_rec, sizeof(*rec_ref->dataset_rec));
             darshan_delete_record_ref(&(hdf5_dataset_runtime->hid_hash), &dataset_id, sizeof(hid_t));
 
 #ifdef HAVE_LDMS

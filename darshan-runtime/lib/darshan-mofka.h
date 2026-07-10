@@ -34,12 +34,19 @@ void darshan_mofka_connector_send(uint64_t record_id, int64_t rank,
                                   int64_t flushes,
                                   double start_time, double end_time,
                                   double total_time,
-                                  char *mod_name, char *data_type);
+                                  char *mod_name, char *data_type,
+                                  const void *rec, uint64_t rec_size);
 
 void darshan_mofka_connector_finalize(void);
 
 #ifdef __cplusplus
 }
+#endif
+
+#ifdef HAVE_MOFKA
+#define DARSHAN_MOFKA_SEND(...) darshan_mofka_connector_send(__VA_ARGS__)
+#else
+#define DARSHAN_MOFKA_SEND(...) do {} while(0)
 #endif
 
 #endif /* __DARSHAN_MOFKA_H */

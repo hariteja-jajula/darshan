@@ -30,6 +30,7 @@
 #include "darshan-dxt.h"
 #include "darshan-heatmap.h"
 #include "darshan-ldms.h"
+#include "darshan-mofka.h"
 
 DARSHAN_FORWARD_DECL(PMPI_File_close, int, (MPI_File *fh));
 DARSHAN_FORWARD_DECL(PMPI_File_iread, int, (MPI_File fh, void  *buf, int  count, MPI_Datatype  datatype, __D_MPI_REQUEST  *request));
@@ -258,6 +259,7 @@ static int my_rank = -1;
     if(dC.ldms_lib)\
         if(dC.mpiio_enable_ldms)\
             darshan_ldms_connector_send(rec_ref->file_rec->base_rec.id, rec_ref->file_rec->base_rec.rank, rec_ref->file_rec->counters[MPIIO_COLL_OPENS] + rec_ref->file_rec->counters[MPIIO_INDEP_OPENS], "open", -1, -1, -1, -1, -1, __tm1, __tm2, rec_ref->file_rec->fcounters[MPIIO_F_META_TIME], "MPIIO", "MET");\
+    DARSHAN_MOFKA_SEND(rec_ref->file_rec->base_rec.id, rec_ref->file_rec->base_rec.rank, rec_ref->file_rec->counters[MPIIO_COLL_OPENS] + rec_ref->file_rec->counters[MPIIO_INDEP_OPENS], "open", -1, -1, -1, -1, -1, __tm1, __tm2, rec_ref->file_rec->fcounters[MPIIO_F_META_TIME], "MPIIO", "MET", (const void*)rec_ref->file_rec, sizeof(*rec_ref->file_rec));\
 } while(0)
 
 /* XXX: this check is needed to work around an OpenMPI bug that is triggered by
@@ -315,6 +317,7 @@ static int get_byte_offset = 0;
     if(dC.ldms_lib)\
         if(dC.mpiio_enable_ldms)\
             darshan_ldms_connector_send(rec_ref->file_rec->base_rec.id, rec_ref->file_rec->base_rec.rank, rec_ref->file_rec->counters[__counter], "read", displacement, size, -1, rec_ref->file_rec->counters[MPIIO_RW_SWITCHES], -1, __tm1, __tm2, rec_ref->file_rec->fcounters[MPIIO_F_READ_TIME], "MPIIO", "MOD");\
+    DARSHAN_MOFKA_SEND(rec_ref->file_rec->base_rec.id, rec_ref->file_rec->base_rec.rank, rec_ref->file_rec->counters[__counter], "read", displacement, size, -1, rec_ref->file_rec->counters[MPIIO_RW_SWITCHES], -1, __tm1, __tm2, rec_ref->file_rec->fcounters[MPIIO_F_READ_TIME], "MPIIO", "MOD", (const void*)rec_ref->file_rec, sizeof(*rec_ref->file_rec));\
 } while(0)
 
 #define MPIIO_RECORD_WRITE(__ret, __fh, __count, __datatype, __offset, __counter, __tm1, __tm2) do { \
@@ -362,6 +365,7 @@ static int get_byte_offset = 0;
     if(dC.ldms_lib)\
         if(dC.mpiio_enable_ldms)\
             darshan_ldms_connector_send(rec_ref->file_rec->base_rec.id, rec_ref->file_rec->base_rec.rank, rec_ref->file_rec->counters[__counter], "write", displacement, size, -1, rec_ref->file_rec->counters[MPIIO_RW_SWITCHES], -1,  __tm1, __tm2, rec_ref->file_rec->fcounters[MPIIO_F_WRITE_TIME], "MPIIO", "MOD");\
+    DARSHAN_MOFKA_SEND(rec_ref->file_rec->base_rec.id, rec_ref->file_rec->base_rec.rank, rec_ref->file_rec->counters[__counter], "write", displacement, size, -1, rec_ref->file_rec->counters[MPIIO_RW_SWITCHES], -1, __tm1, __tm2, rec_ref->file_rec->fcounters[MPIIO_F_WRITE_TIME], "MPIIO", "MOD", (const void*)rec_ref->file_rec, sizeof(*rec_ref->file_rec));\
 } while(0)
 
 /**********************************************************
@@ -1312,6 +1316,7 @@ int DARSHAN_DECL(MPI_File_close)(MPI_File *fh)
         if(dC.ldms_lib)
             if(dC.mpiio_enable_ldms)
                 darshan_ldms_connector_send(rec_ref->file_rec->base_rec.id, rec_ref->file_rec->base_rec.rank, rec_ref->close_counts, "close", -1, -1, -1, -1, -1, tm1, tm2, rec_ref->file_rec->fcounters[MPIIO_F_META_TIME], "MPIIO", "MOD");
+        DARSHAN_MOFKA_SEND(rec_ref->file_rec->base_rec.id, rec_ref->file_rec->base_rec.rank, rec_ref->close_counts, "close", -1, -1, -1, -1, -1, tm1, tm2, rec_ref->file_rec->fcounters[MPIIO_F_META_TIME], "MPIIO", "MOD", (const void*)rec_ref->file_rec, sizeof(*rec_ref->file_rec));
 #endif
     }
     MPIIO_POST_RECORD();

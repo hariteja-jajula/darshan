@@ -88,6 +88,7 @@
 #include "darshan-dynamic.h"
 #include "darshan-heatmap.h"
 #include "darshan-ldms.h"
+#include "darshan-mofka.h"
 
 #ifndef HAVE_OFF64_T
 typedef int64_t off64_t;
@@ -241,6 +242,7 @@ extern int __real_fileno(FILE *stream);
     if(dC.ldms_lib)\
         if(dC.stdio_enable_ldms)\
             darshan_ldms_connector_send(__rec_ref->file_rec->base_rec.id, __rec_ref->file_rec->base_rec.rank,__rec_ref->file_rec->counters[STDIO_OPENS], "open", -1, -1, -1, -1, -1, __tm1, __tm2, __rec_ref->file_rec->fcounters[STDIO_F_META_TIME], "STDIO", "MET");\
+    DARSHAN_MOFKA_SEND(__rec_ref->file_rec->base_rec.id, __rec_ref->file_rec->base_rec.rank, __rec_ref->file_rec->counters[STDIO_OPENS], "open", -1, -1, -1, -1, -1, __tm1, __tm2, __rec_ref->file_rec->fcounters[STDIO_F_META_TIME], "STDIO", "MET", (const void*)__rec_ref->file_rec, sizeof(*__rec_ref->file_rec));\
 } while(0)
 
 #define STDIO_RECORD_REFOPEN(__ret, __rec_ref, __tm1, __tm2, __ref_counter) do { \
@@ -283,6 +285,7 @@ extern int __real_fileno(FILE *stream);
     if(dC.ldms_lib)\
         if(dC.stdio_enable_ldms) \
             darshan_ldms_connector_send(rec_ref->file_rec->base_rec.id, rec_ref->file_rec->base_rec.rank, rec_ref->file_rec->counters[STDIO_READS], "read", this_offset, __bytes, rec_ref->file_rec->counters[STDIO_MAX_BYTE_READ], -1, -1, __tm1, __tm2, rec_ref->file_rec->fcounters[STDIO_F_READ_TIME],"STDIO", "MOD"); \
+    DARSHAN_MOFKA_SEND(rec_ref->file_rec->base_rec.id, rec_ref->file_rec->base_rec.rank, rec_ref->file_rec->counters[STDIO_READS], "read", this_offset, __bytes, rec_ref->file_rec->counters[STDIO_MAX_BYTE_READ], -1, -1, __tm1, __tm2, rec_ref->file_rec->fcounters[STDIO_F_READ_TIME], "STDIO", "MOD", (const void*)rec_ref->file_rec, sizeof(*rec_ref->file_rec));\
 } while(0)
 
 #define STDIO_RECORD_WRITE(__fp, __bytes,  __tm1, __tm2, __fflush_flag) do{ \
@@ -310,6 +313,7 @@ extern int __real_fileno(FILE *stream);
     if(dC.ldms_lib)\
         if(dC.stdio_enable_ldms)\
             darshan_ldms_connector_send(rec_ref->file_rec->base_rec.id, rec_ref->file_rec->base_rec.rank, rec_ref->file_rec->counters[STDIO_WRITES], "write", this_offset, __bytes, rec_ref->file_rec->counters[STDIO_MAX_BYTE_WRITTEN], -1, rec_ref->file_rec->counters[STDIO_FLUSHES], __tm1, __tm2,  rec_ref->file_rec->fcounters[STDIO_F_WRITE_TIME], "STDIO", "MOD"); \
+    DARSHAN_MOFKA_SEND(rec_ref->file_rec->base_rec.id, rec_ref->file_rec->base_rec.rank, rec_ref->file_rec->counters[STDIO_WRITES], "write", this_offset, __bytes, rec_ref->file_rec->counters[STDIO_MAX_BYTE_WRITTEN], -1, rec_ref->file_rec->counters[STDIO_FLUSHES], __tm1, __tm2, rec_ref->file_rec->fcounters[STDIO_F_WRITE_TIME], "STDIO", "MOD", (const void*)rec_ref->file_rec, sizeof(*rec_ref->file_rec));\
 } while(0)
 
 FILE* DARSHAN_DECL(fopen)(const char *path, const char *mode)
@@ -493,6 +497,7 @@ int DARSHAN_DECL(fclose)(FILE *fp)
         if(dC.ldms_lib)
             if(dC.stdio_enable_ldms)
                 darshan_ldms_connector_send(rec_ref->file_rec->base_rec.id, rec_ref->file_rec->base_rec.rank, rec_ref->close_counts, "close", -1, -1, -1, -1, rec_ref->file_rec->counters[STDIO_FLUSHES], tm1, tm2, rec_ref->file_rec->fcounters[STDIO_F_META_TIME], "STDIO", "MOD");
+        DARSHAN_MOFKA_SEND(rec_ref->file_rec->base_rec.id, rec_ref->file_rec->base_rec.rank, rec_ref->close_counts, "close", -1, -1, -1, -1, rec_ref->file_rec->counters[STDIO_FLUSHES], tm1, tm2, rec_ref->file_rec->fcounters[STDIO_F_META_TIME], "STDIO", "MOD", (const void*)rec_ref->file_rec, sizeof(*rec_ref->file_rec));
 #endif
     }
     STDIO_POST_RECORD();

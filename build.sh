@@ -22,11 +22,21 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 [ -f "$DIASPORA_C/include/diaspora/diaspora_c.h" ] || {
     echo "build.sh: no include/diaspora/diaspora_c.h under DIASPORA_C=$DIASPORA_C"; exit 1; }
 
-CC="${CC:-$(command -v gcc || command -v cc)}"
-CXX="${CXX:-$(command -v g++ || command -v c++)}"
-PREFIX="${PREFIX:-$HERE/install}"
 SRC="$HERE/darshan-runtime"
-BUILD="$HERE/_build"
+if [ "${DARSHAN_MPI:-0}" = "1" ]; then
+    CC="${CC:-$(command -v mpicc)}"
+    CXX="${CXX:-$(command -v mpicxx || command -v mpic++)}"
+    PREFIX="${PREFIX:-$HERE/install-mpi}"
+    BUILD="$HERE/_build-mpi"
+    MPI_FLAG=""
+    echo "=== WITH-MPI build: CC=$CC prefix=$PREFIX ==="
+else
+    CC="${CC:-$(command -v gcc || command -v cc)}"
+    CXX="${CXX:-$(command -v g++ || command -v c++)}"
+    PREFIX="${PREFIX:-$HERE/install}"
+    BUILD="$HERE/_build"
+    MPI_FLAG="--without-mpi"
+fi
 
 # --- ensure the build tree belongs to THIS srcdir ----------------------------
 # config.status records the srcdir it was configured with; a stale/foreign one
@@ -65,7 +75,7 @@ sh "$SRC/configure" \
     --prefix="$PREFIX" \
     --with-log-path-by-env=DARSHAN_LOGPATH \
     --with-jobid-env=PBS_JOBID \
-    --without-mpi \
+    $MPI_FLAG \
     --with-diaspora-c="$DIASPORA_C" \
     DIASPORA_C_CFLAGS="-I$DIASPORA_C/include" \
     DIASPORA_C_LIBS="-L$DIASPORA_C/lib -ldiaspora-c -ldiaspora-stream-api -lstdc++" \
