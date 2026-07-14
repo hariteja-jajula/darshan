@@ -124,6 +124,9 @@ void darshan_mofka_connector_initialize(struct darshan_core_runtime* init_core)
     if (topic_name == NULL || *topic_name == '\0') topic_name = "darshan";
 
     size_t batch_size = MOFKA_BATCH_SIZE, max_batches = 0;
+    { const char* e;
+      if ((e = getenv("DARSHAN_MOFKA_BATCH"))       && *e) batch_size  = (size_t)strtoull(e, NULL, 10);
+      if ((e = getenv("DARSHAN_MOFKA_MAX_BATCHES"))  && *e) max_batches = (size_t)strtoull(e, NULL, 10); }
 
     if (group_file == NULL || *group_file == '\0') {
         darshan_core_fprintf(stderr, "darshan-mofka: DARSHAN_MOFKA_GROUP_FILE not set; "
@@ -259,7 +262,9 @@ void darshan_mofka_connector_finalize(void)
     if (g_producer == NULL) goto clear;
 
     t0 = now_ns();
-    rc = diaspora_producer_flush_timeout(g_producer, 5000);
+    { const char* fe = getenv("DARSHAN_MOFKA_FLUSH_MS");
+      unsigned flush_ms = (fe && *fe) ? (unsigned)strtoul(fe, NULL, 10) : 5000;
+      rc = diaspora_producer_flush_timeout(g_producer, flush_ms); }
     if (rc == DIASPORA_C_TIMEOUT)
         darshan_core_fprintf(stderr, "darshan-mofka: flush timed out; leaking handles.\n");
     else if (rc == DIASPORA_C_ERR)
