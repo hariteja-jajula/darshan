@@ -1,4 +1,7 @@
 /*
+ * Copyright (C) 2026 University of Chicago.
+ * See COPYRIGHT notice in top-level directory.
+ *
  * darshan-mofka-reconstruct.c -- best-effort partial .darshan reconstruction
  * from Darshan->Mofka JSONL captures.
  *
@@ -65,18 +68,11 @@ struct job_info
     char hostname[256];
 };
 
+static int hex_value(int c);   /* fwd decl: used by json_get_string's \u case */
+
 static void usage(const char *prog)
 {
     fprintf(stderr, "Usage: %s <events.jsonl> <job_partial.darshan>\n", prog);
-}
-
-static char *xstrndup(const char *s, size_t n)
-{
-    char *out = malloc(n + 1);
-    if(!out) return NULL;
-    memcpy(out, s, n);
-    out[n] = '\0';
-    return out;
 }
 
 static const char *json_find_key(const char *line, const char *key)
@@ -124,6 +120,67 @@ static char *json_get_string(const char *line, const char *key)
                 case 'n': out[n++] = '\n'; break;
                 case 'r': out[n++] = '\r'; break;
                 case 't': out[n++] = '\t'; break;
+                case 'u':
+                {
+                    /* \uXXXX -> UTF-8. capture.py's json.dumps uses the default
+                     * ensure_ascii=True, so every non-ASCII filename byte arrives
+                     * here as \uXXXX; without this it decoded to the literal
+                     * "uXXXX" (e.g. "resume" from an accented name). UTF-8 output
+                     * is always shorter than the \uXXXX input, so out[] (sized
+                     * strlen(p)+1) never overflows. */
+                    int h0, h1, h2, h3;
+                    unsigned int cp;
+                    if(p[1] && p[2] && p[3] && p[4] &&
+                       (h0 = hex_value((unsigned char)p[1])) >= 0 &&
+                       (h1 = hex_value((unsigned char)p[2])) >= 0 &&
+                       (h2 = hex_value((unsigned char)p[3])) >= 0 &&
+                       (h3 = hex_value((unsigned char)p[4])) >= 0)
+                    {
+                        cp = (unsigned int)((h0 << 12) | (h1 << 8) | (h2 << 4) | h3);
+                        p += 4;   /* consume the 4 hex digits (outer p++ eats 'u') */
+                        /* high surrogate: try to pair with a following \uXXXX */
+                        if(cp >= 0xD800 && cp <= 0xDBFF &&
+                           p[1] == '\\' && p[2] == 'u' &&
+                           p[3] && p[4] && p[5] && p[6] &&
+                           (h0 = hex_value((unsigned char)p[3])) >= 0 &&
+                           (h1 = hex_value((unsigned char)p[4])) >= 0 &&
+                           (h2 = hex_value((unsigned char)p[5])) >= 0 &&
+                           (h3 = hex_value((unsigned char)p[6])) >= 0)
+                        {
+                            unsigned int lo = (unsigned int)((h0 << 12) | (h1 << 8) | (h2 << 4) | h3);
+                            if(lo >= 0xDC00 && lo <= 0xDFFF)
+                            {
+                                cp = 0x10000 + (((cp - 0xD800) << 10) | (lo - 0xDC00));
+                                p += 6;   /* consume "\uXXXX" of the low surrogate */
+                            }
+                        }
+                        if(cp < 0x80)
+                            out[n++] = (char)cp;
+                        else if(cp < 0x800)
+                        {
+                            out[n++] = (char)(0xC0 | (cp >> 6));
+                            out[n++] = (char)(0x80 | (cp & 0x3F));
+                        }
+                        else if(cp < 0x10000)
+                        {
+                            out[n++] = (char)(0xE0 | (cp >> 12));
+                            out[n++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+                            out[n++] = (char)(0x80 | (cp & 0x3F));
+                        }
+                        else
+                        {
+                            out[n++] = (char)(0xF0 | (cp >> 18));
+                            out[n++] = (char)(0x80 | ((cp >> 12) & 0x3F));
+                            out[n++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+                            out[n++] = (char)(0x80 | (cp & 0x3F));
+                        }
+                    }
+                    else
+                    {
+                        out[n++] = *p;   /* malformed \u: keep old passthrough */
+                    }
+                    break;
+                }
                 default: out[n++] = *p; break;
             }
             p++;
@@ -228,8 +285,10 @@ static void *decode_hex(const char *hex, size_t expected, size_t *out_len)
     hex_len = strlen(hex);
     if(hex_len % 2 != 0) return NULL;
     n = hex_len / 2;
-    if(expected > 0 && n < expected) return NULL;
-    if(expected > 0 && n > expected) n = expected;
+    /* For a fixed-layout module struct, only an exact size match is safe.
+     * Trimming an oversized payload would silently pass a structurally-wrong
+     * record (masking runtime/logutils version skew), so reject it instead. */
+    if(expected > 0 && n != expected) return NULL;
 
     buf = malloc(n ? n : 1);
     if(!buf) return NULL;
@@ -593,17 +652,30 @@ static int write_log(const char *outfile, struct stream_record *records,
     free_namehash(name_hash);
     if(ret < 0) goto fail;
 
-    HASH_ITER(hlink, records, rec, tmp)
+    /* Write module records in ascending module-id order. darshan_log_dzwrite
+     * hard-fails if a record is written to a module region id lower than the
+     * previous one, and modules interleave in the stream (POSIX=1, MPIIO=2,
+     * STDIO=9), so writing in hash/first-seen order rejects any normal
+     * multi-module capture. The outer loop over ascending module ids matches
+     * darshan's own writers (darshan-convert.c / darshan-merge.c) and also
+     * bounds the mod_logutils[] index correctly (it has DARSHAN_KNOWN_MODULE_COUNT
+     * entries, not DARSHAN_MAX_MODS). */
     {
-        if(rec->key.mod_id < 0 || rec->key.mod_id >= DARSHAN_MAX_MODS ||
-           !mod_logutils[rec->key.mod_id])
-            continue;
-        ret = mod_logutils[rec->key.mod_id]->log_put_record(out, rec->buf);
-        if(ret < 0)
+        int m;
+        for(m = 0; m < DARSHAN_KNOWN_MODULE_COUNT; m++)
         {
-            fprintf(stderr, "Error: failed writing module record mod_id=%d record_id=%" PRIu64 "\n",
-                rec->key.mod_id, rec->key.record_id);
-            goto fail;
+            if(!mod_logutils[m]) continue;
+            HASH_ITER(hlink, records, rec, tmp)
+            {
+                if(rec->key.mod_id != m) continue;
+                ret = mod_logutils[m]->log_put_record(out, rec->buf);
+                if(ret < 0)
+                {
+                    fprintf(stderr, "Error: failed writing module record mod_id=%d record_id=%" PRIu64 "\n",
+                        rec->key.mod_id, rec->key.record_id);
+                    goto fail;
+                }
+            }
         }
     }
 
