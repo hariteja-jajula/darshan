@@ -1,0 +1,660 @@
+/*
+ * darshan-mofka-reconstruct.c -- best-effort partial .darshan reconstruction
+ * from Darshan->Mofka JSONL captures.
+ *
+ * Input is the JSONL produced by server/capture.py in the parent demo repo.
+ * The tool keeps the latest rec_hex snapshot for each (module, record_id, rank)
+ * and writes those module records into a partial Darshan log.
+ */
+#ifdef HAVE_CONFIG_H
+# include "darshan-util-config.h"
+#endif
+
+#define _GNU_SOURCE
+#include <ctype.h>
+#include <errno.h>
+#include <inttypes.h>
+#include <limits.h>
+#include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+#include "uthash-1.9.2/src/uthash.h"
+#include "darshan-logutils.h"
+
+struct rec_key
+{
+    int mod_id;
+    uint64_t record_id;
+    int64_t rank;
+};
+
+struct stream_record
+{
+    struct rec_key key;
+    void *buf;
+    size_t len;
+    unsigned long long seq;
+    double ended_at;
+    UT_hash_handle hlink;
+};
+
+struct name_ent
+{
+    uint64_t id;
+    char *name;
+    UT_hash_handle hlink;
+};
+
+struct rank_ent
+{
+    int64_t rank;
+    UT_hash_handle hlink;
+};
+
+struct job_info
+{
+    int have_uid;
+    int have_jobid;
+    int64_t uid;
+    int64_t jobid;
+    double start_time;
+    double end_time;
+    char hostname[256];
+};
+
+static void usage(const char *prog)
+{
+    fprintf(stderr, "Usage: %s <events.jsonl> <job_partial.darshan>\n", prog);
+}
+
+static char *xstrndup(const char *s, size_t n)
+{
+    char *out = malloc(n + 1);
+    if(!out) return NULL;
+    memcpy(out, s, n);
+    out[n] = '\0';
+    return out;
+}
+
+static const char *json_find_key(const char *line, const char *key)
+{
+    char needle[128];
+    snprintf(needle, sizeof(needle), "\"%s\":", key);
+    return strstr(line, needle);
+}
+
+static char *json_get_string(const char *line, const char *key)
+{
+    const char *p = json_find_key(line, key);
+    const char *s;
+    char *out;
+    size_t cap, n;
+
+    if(!p) return NULL;
+    p = strchr(p, ':');
+    if(!p) return NULL;
+    p++;
+    while(*p && isspace((unsigned char)*p)) p++;
+    if(*p != '"') return NULL;
+    p++;
+    s = p;
+
+    cap = strlen(p) + 1;
+    out = malloc(cap);
+    if(!out) return NULL;
+    n = 0;
+
+    while(*p)
+    {
+        if(*p == '"')
+            break;
+        if(*p == '\\' && p[1])
+        {
+            p++;
+            switch(*p)
+            {
+                case '"': out[n++] = '"'; break;
+                case '\\': out[n++] = '\\'; break;
+                case '/': out[n++] = '/'; break;
+                case 'b': out[n++] = '\b'; break;
+                case 'f': out[n++] = '\f'; break;
+                case 'n': out[n++] = '\n'; break;
+                case 'r': out[n++] = '\r'; break;
+                case 't': out[n++] = '\t'; break;
+                default: out[n++] = *p; break;
+            }
+            p++;
+        }
+        else
+        {
+            out[n++] = *p++;
+        }
+    }
+
+    (void)s;
+    out[n] = '\0';
+    return out;
+}
+
+static int json_get_i64(const char *line, const char *key, int64_t *out)
+{
+    const char *p = json_find_key(line, key);
+    char *end = NULL;
+    long long v;
+
+    if(!p) return 0;
+    p = strchr(p, ':');
+    if(!p) return 0;
+    p++;
+    while(*p && isspace((unsigned char)*p)) p++;
+    v = strtoll(p, &end, 10);
+    if(end == p) return 0;
+    *out = (int64_t)v;
+    return 1;
+}
+
+static int json_get_u64(const char *line, const char *key, uint64_t *out)
+{
+    const char *p = json_find_key(line, key);
+    char *end = NULL;
+    unsigned long long v;
+
+    if(!p) return 0;
+    p = strchr(p, ':');
+    if(!p) return 0;
+    p++;
+    while(*p && isspace((unsigned char)*p)) p++;
+    v = strtoull(p, &end, 10);
+    if(end == p) return 0;
+    *out = (uint64_t)v;
+    return 1;
+}
+
+static int json_get_u64_hex_or_dec(const char *line, const char *key, uint64_t *out)
+{
+    char *s = json_get_string(line, key);
+    char *end = NULL;
+    unsigned long long v;
+
+    if(s)
+    {
+        v = strtoull(s, &end, 16);
+        if(end != s)
+        {
+            *out = (uint64_t)v;
+            free(s);
+            return 1;
+        }
+        free(s);
+    }
+
+    return json_get_u64(line, key, out);
+}
+
+static int json_get_double(const char *line, const char *key, double *out)
+{
+    const char *p = json_find_key(line, key);
+    char *end = NULL;
+    double v;
+
+    if(!p) return 0;
+    p = strchr(p, ':');
+    if(!p) return 0;
+    p++;
+    while(*p && isspace((unsigned char)*p)) p++;
+    v = strtod(p, &end);
+    if(end == p) return 0;
+    *out = v;
+    return 1;
+}
+
+static int hex_value(int c)
+{
+    if(c >= '0' && c <= '9') return c - '0';
+    if(c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if(c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+static void *decode_hex(const char *hex, size_t expected, size_t *out_len)
+{
+    size_t hex_len, n, i;
+    unsigned char *buf;
+
+    if(!hex) return NULL;
+    hex_len = strlen(hex);
+    if(hex_len % 2 != 0) return NULL;
+    n = hex_len / 2;
+    if(expected > 0 && n < expected) return NULL;
+    if(expected > 0 && n > expected) n = expected;
+
+    buf = malloc(n ? n : 1);
+    if(!buf) return NULL;
+    for(i = 0; i < n; i++)
+    {
+        int hi = hex_value((unsigned char)hex[2*i]);
+        int lo = hex_value((unsigned char)hex[2*i + 1]);
+        if(hi < 0 || lo < 0)
+        {
+            free(buf);
+            return NULL;
+        }
+        buf[i] = (unsigned char)((hi << 4) | lo);
+    }
+    *out_len = n;
+    return buf;
+}
+
+static int module_name_to_id(const char *module)
+{
+    if(!module) return -1;
+    if(strcmp(module, "POSIX") == 0) return DARSHAN_POSIX_MOD;
+    if(strcmp(module, "STDIO") == 0) return DARSHAN_STDIO_MOD;
+    if(strcmp(module, "MPIIO") == 0 || strcmp(module, "MPI-IO") == 0) return DARSHAN_MPIIO_MOD;
+    if(strcmp(module, "H5F") == 0) return DARSHAN_H5F_MOD;
+    if(strcmp(module, "H5D") == 0) return DARSHAN_H5D_MOD;
+    return -1;
+}
+
+static int expected_record_size(int mod_id)
+{
+    switch(mod_id)
+    {
+        case DARSHAN_POSIX_MOD: return sizeof(struct darshan_posix_file);
+        case DARSHAN_STDIO_MOD: return sizeof(struct darshan_stdio_file);
+        case DARSHAN_MPIIO_MOD: return sizeof(struct darshan_mpiio_file);
+        case DARSHAN_H5F_MOD: return sizeof(struct darshan_hdf5_file);
+        case DARSHAN_H5D_MOD: return sizeof(struct darshan_hdf5_dataset);
+        default: return -1;
+    }
+}
+
+static void add_name(struct name_ent **names, uint64_t id, const char *name)
+{
+    struct name_ent *ent;
+    if(!name || !*name) return;
+    HASH_FIND(hlink, *names, &id, sizeof(id), ent);
+    if(ent) return;
+    ent = calloc(1, sizeof(*ent));
+    if(!ent) return;
+    ent->id = id;
+    ent->name = strdup(name);
+    if(!ent->name)
+    {
+        free(ent);
+        return;
+    }
+    HASH_ADD(hlink, *names, id, sizeof(ent->id), ent);
+}
+
+static void add_rank(struct rank_ent **ranks, int64_t rank)
+{
+    struct rank_ent *ent;
+    if(rank < 0) return;
+    HASH_FIND(hlink, *ranks, &rank, sizeof(rank), ent);
+    if(ent) return;
+    ent = calloc(1, sizeof(*ent));
+    if(!ent) return;
+    ent->rank = rank;
+    HASH_ADD(hlink, *ranks, rank, sizeof(ent->rank), ent);
+}
+
+static int should_replace(struct stream_record *old, unsigned long long seq, double ended_at)
+{
+    if(!old) return 1;
+    if(seq > old->seq) return 1;
+    if(seq == old->seq && ended_at > old->ended_at) return 1;
+    return 0;
+}
+
+static void add_record(struct stream_record **records, int mod_id, uint64_t record_id,
+    int64_t rank, void *buf, size_t len, unsigned long long seq, double ended_at)
+{
+    struct rec_key key;
+    struct stream_record *ent;
+
+    memset(&key, 0, sizeof(key));
+    key.mod_id = mod_id;
+    key.record_id = record_id;
+    key.rank = rank;
+
+    HASH_FIND(hlink, *records, &key, sizeof(key), ent);
+    if(!should_replace(ent, seq, ended_at))
+    {
+        free(buf);
+        return;
+    }
+
+    if(!ent)
+    {
+        ent = calloc(1, sizeof(*ent));
+        if(!ent)
+        {
+            free(buf);
+            return;
+        }
+        ent->key = key;
+        HASH_ADD(hlink, *records, key, sizeof(ent->key), ent);
+    }
+    else
+    {
+        free(ent->buf);
+    }
+
+    ent->buf = buf;
+    ent->len = len;
+    ent->seq = seq;
+    ent->ended_at = ended_at;
+}
+
+static void update_job_info(struct job_info *job, const char *line)
+{
+    int64_t v;
+    double d;
+    char *s;
+
+    if(!job->have_uid && json_get_i64(line, "uid", &v))
+    {
+        job->uid = v;
+        job->have_uid = 1;
+    }
+    if(!job->have_jobid && json_get_i64(line, "job_id", &v))
+    {
+        job->jobid = v;
+        job->have_jobid = 1;
+    }
+    if(json_get_double(line, "started_at", &d))
+    {
+        if(job->start_time == 0.0 || d < job->start_time) job->start_time = d;
+    }
+    if(json_get_double(line, "ended_at", &d))
+    {
+        if(d > job->end_time) job->end_time = d;
+    }
+    if(job->start_time == 0.0 && json_get_double(line, "t0_epoch", &d))
+        job->start_time = d;
+
+    s = json_get_string(line, "hostname");
+    if(s)
+    {
+        if(job->hostname[0] == '\0')
+        {
+            snprintf(job->hostname, sizeof(job->hostname), "%s", s);
+        }
+        free(s);
+    }
+}
+
+static struct darshan_name_record_ref *build_namehash(struct name_ent *names)
+{
+    struct darshan_name_record_ref *name_hash = NULL;
+    struct name_ent *ent, *tmp;
+
+    HASH_ITER(hlink, names, ent, tmp)
+    {
+        struct darshan_name_record_ref *ref;
+        size_t name_len = strlen(ent->name);
+        ref = calloc(1, sizeof(*ref));
+        if(!ref) continue;
+        ref->name_record = malloc(sizeof(struct darshan_name_record) + name_len);
+        if(!ref->name_record)
+        {
+            free(ref);
+            continue;
+        }
+        ref->name_record->id = ent->id;
+        memcpy(ref->name_record->name, ent->name, name_len + 1);
+        HASH_ADD(hlink, name_hash, name_record->id, sizeof(darshan_record_id), ref);
+    }
+
+    return name_hash;
+}
+
+static void free_namehash(struct darshan_name_record_ref *hash)
+{
+    struct darshan_name_record_ref *ref, *tmp;
+    HASH_ITER(hlink, hash, ref, tmp)
+    {
+        HASH_DELETE(hlink, hash, ref);
+        free(ref->name_record);
+        free(ref);
+    }
+}
+
+static void free_names(struct name_ent *names)
+{
+    struct name_ent *ent, *tmp;
+    HASH_ITER(hlink, names, ent, tmp)
+    {
+        HASH_DELETE(hlink, names, ent);
+        free(ent->name);
+        free(ent);
+    }
+}
+
+static void free_records(struct stream_record *records)
+{
+    struct stream_record *ent, *tmp;
+    HASH_ITER(hlink, records, ent, tmp)
+    {
+        HASH_DELETE(hlink, records, ent);
+        free(ent->buf);
+        free(ent);
+    }
+}
+
+static void free_ranks(struct rank_ent *ranks)
+{
+    struct rank_ent *ent, *tmp;
+    HASH_ITER(hlink, ranks, ent, tmp)
+    {
+        HASH_DELETE(hlink, ranks, ent);
+        free(ent);
+    }
+}
+
+static int read_events(const char *path, struct stream_record **records,
+    struct name_ent **names, struct rank_ent **ranks, struct job_info *job,
+    unsigned long long *event_count)
+{
+    FILE *fp;
+    char *line = NULL;
+    size_t cap = 0;
+    ssize_t nread;
+
+    fp = fopen(path, "r");
+    if(!fp)
+    {
+        fprintf(stderr, "Error: cannot open %s: %s\n", path, strerror(errno));
+        return -1;
+    }
+
+    while((nread = getline(&line, &cap, fp)) != -1)
+    {
+        char *module = NULL, *file = NULL, *hex = NULL;
+        uint64_t record_id = 0;
+        int64_t rank = -1, rec_size_i = 0;
+        unsigned long long seq = 0;
+        double ended_at = 0.0;
+        int mod_id, exp_size;
+        void *buf;
+        size_t len;
+
+        (void)nread;
+        update_job_info(job, line);
+
+        module = json_get_string(line, "module");
+        mod_id = module_name_to_id(module);
+        if(mod_id < 0) goto next;
+
+        if(!json_get_u64_hex_or_dec(line, "record_id", &record_id)) goto next;
+        json_get_i64(line, "rank", &rank);
+        json_get_i64(line, "rec_size", &rec_size_i);
+        { uint64_t seq_u = 0; if(json_get_u64(line, "seq", &seq_u)) seq = (unsigned long long)seq_u; }
+        json_get_double(line, "ended_at", &ended_at);
+
+        exp_size = expected_record_size(mod_id);
+        if(exp_size <= 0) goto next;
+        if(rec_size_i > 0 && rec_size_i != exp_size)
+        {
+            /* For v1, only reconstruct fixed-size records that match this build. */
+            goto next;
+        }
+
+        hex = json_get_string(line, "rec_hex");
+        buf = decode_hex(hex, (size_t)exp_size, &len);
+        if(!buf || len != (size_t)exp_size)
+        {
+            free(buf);
+            goto next;
+        }
+
+        file = json_get_string(line, "file");
+        if(file) add_name(names, record_id, file);
+        add_rank(ranks, rank);
+        add_record(records, mod_id, record_id, rank, buf, len, seq, ended_at);
+        (*event_count)++;
+
+next:
+        free(module);
+        free(file);
+        free(hex);
+    }
+
+    free(line);
+    fclose(fp);
+    return 0;
+}
+
+static void fill_job(struct darshan_job *out, const struct job_info *in,
+    int64_t nprocs)
+{
+    double start = in->start_time;
+    double end = in->end_time;
+
+    memset(out, 0, sizeof(*out));
+    out->uid = in->have_uid ? in->uid : -1;
+    out->jobid = in->have_jobid ? in->jobid : -1;
+    out->nprocs = nprocs > 0 ? nprocs : 1;
+
+    if(start <= 0.0) start = (double)time(NULL);
+    if(end < start) end = start;
+
+    out->start_time_sec = (int64_t)start;
+    out->start_time_nsec = (int64_t)((start - floor(start)) * 1000000000.0);
+    out->end_time_sec = (int64_t)end;
+    out->end_time_nsec = (int64_t)((end - floor(end)) * 1000000000.0);
+
+    snprintf(out->metadata, sizeof(out->metadata),
+        "lib_ver=unknown\nreconstructed_from=mofka_jsonl\npartial=true\nhostname=%s\n",
+        in->hostname[0] ? in->hostname : "unknown");
+}
+
+static int write_log(const char *outfile, struct stream_record *records,
+    struct name_ent *names, struct rank_ent *ranks, const struct job_info *job_info)
+{
+    darshan_fd out;
+    struct darshan_job job;
+    struct darshan_name_record_ref *name_hash;
+    struct stream_record *rec, *tmp;
+    struct darshan_mnt_info mnt;
+    uint64_t partial = 0;
+    int ret;
+    int64_t nprocs = (int64_t)HASH_CNT(hlink, ranks);
+
+    HASH_ITER(hlink, records, rec, tmp)
+        DARSHAN_MOD_FLAG_SET(partial, rec->key.mod_id);
+
+    out = darshan_log_create(outfile, DARSHAN_ZLIB_COMP, partial);
+    if(!out)
+    {
+        fprintf(stderr, "Error: cannot create %s\n", outfile);
+        return -1;
+    }
+
+    fill_job(&job, job_info, nprocs);
+    ret = darshan_log_put_job(out, &job);
+    if(ret < 0) goto fail;
+
+    ret = darshan_log_put_exe(out, "reconstructed-from-mofka-stream");
+    if(ret < 0) goto fail;
+
+    memset(&mnt, 0, sizeof(mnt));
+    snprintf(mnt.mnt_type, sizeof(mnt.mnt_type), "unknown");
+    snprintf(mnt.mnt_path, sizeof(mnt.mnt_path), "/");
+    ret = darshan_log_put_mounts(out, &mnt, 1);
+    if(ret < 0) goto fail;
+
+    name_hash = build_namehash(names);
+    ret = darshan_log_put_namehash(out, name_hash);
+    free_namehash(name_hash);
+    if(ret < 0) goto fail;
+
+    HASH_ITER(hlink, records, rec, tmp)
+    {
+        if(rec->key.mod_id < 0 || rec->key.mod_id >= DARSHAN_MAX_MODS ||
+           !mod_logutils[rec->key.mod_id])
+            continue;
+        ret = mod_logutils[rec->key.mod_id]->log_put_record(out, rec->buf);
+        if(ret < 0)
+        {
+            fprintf(stderr, "Error: failed writing module record mod_id=%d record_id=%" PRIu64 "\n",
+                rec->key.mod_id, rec->key.record_id);
+            goto fail;
+        }
+    }
+
+    darshan_log_close(out);
+    return 0;
+
+fail:
+    fprintf(stderr, "Error: failed writing %s\n", outfile);
+    darshan_log_close(out);
+    return -1;
+}
+
+int main(int argc, char **argv)
+{
+    struct stream_record *records = NULL;
+    struct name_ent *names = NULL;
+    struct rank_ent *ranks = NULL;
+    struct job_info job;
+    unsigned long long event_count = 0;
+    int ret;
+
+    if(argc != 3)
+    {
+        usage(argv[0]);
+        return 1;
+    }
+
+    memset(&job, 0, sizeof(job));
+
+    ret = read_events(argv[1], &records, &names, &ranks, &job, &event_count);
+    if(ret < 0)
+        return 1;
+
+    if(HASH_CNT(hlink, records) == 0)
+    {
+        fprintf(stderr, "Error: no reconstructable module records found in %s\n", argv[1]);
+        free_records(records);
+        free_names(names);
+        free_ranks(ranks);
+        return 1;
+    }
+
+    ret = write_log(argv[2], records, names, ranks, &job);
+    if(ret == 0)
+    {
+        fprintf(stderr, "reconstructed %u module records from %llu streamed events into %s\n",
+            (unsigned)HASH_CNT(hlink, records), event_count, argv[2]);
+    }
+
+    free_records(records);
+    free_names(names);
+    free_ranks(ranks);
+    return ret == 0 ? 0 : 1;
+}
