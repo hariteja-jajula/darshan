@@ -84,19 +84,6 @@ static void hex_into(char* dst, size_t dstsz, const void* src, uint64_t n)
     dst[o] = '\0';
 }
 
-static int module_enabled_for(const char* mod)
-{
-    if (mod == NULL) return 0;
-    if (strcmp(mod, "POSIX") == 0)  return mC.posix_enable_mofka;
-    if (strcmp(mod, "STDIO") == 0)  return mC.stdio_enable_mofka;
-    if (strcmp(mod, "MPIIO") == 0 ||
-        strcmp(mod, "MPI-IO") == 0) return mC.mpiio_enable_mofka;
-    if (strcmp(mod, "H5F") == 0 ||
-        strcmp(mod, "H5D") == 0 ||
-        strcmp(mod, "HDF5") == 0)   return mC.hdf5_enable_mofka;
-    return 0;
-}
-
 void darshan_mofka_connector_initialize(struct darshan_core_runtime* init_core)
 {
     const char* group_file;
@@ -163,11 +150,6 @@ void darshan_mofka_connector_initialize(struct darshan_core_runtime* init_core)
         return;
     }
 
-    mC.posix_enable_mofka = (getenv("DARSHAN_MOFKA_ENABLE_POSIX") != NULL);
-    mC.stdio_enable_mofka = (getenv("DARSHAN_MOFKA_ENABLE_STDIO") != NULL);
-    mC.mpiio_enable_mofka = (getenv("DARSHAN_MOFKA_ENABLE_MPIIO") != NULL);
-    mC.hdf5_enable_mofka  = (getenv("DARSHAN_MOFKA_ENABLE_HDF5")  != NULL);
-
     if (getenv("DARSHAN_MOFKA_VERBOSE"))
         darshan_core_fprintf(stderr, "darshan-mofka: producer connected to topic '%s' "
                 "(batch_size=%zu max_num_batches=%zu)\n",
@@ -201,7 +183,10 @@ void darshan_mofka_connector_send(uint64_t record_id, int64_t rank,
     t0 = now_ns();
 
     if (g_producer == NULL) goto out;
-    if (!module_enabled_for(mod_name)) goto out;
+    if (!(mod_name &&
+        (strcmp(mod_name, "POSIX") == 0 || strcmp(mod_name, "STDIO") == 0 ||
+         strcmp(mod_name, "MPI-IO") == 0 || strcmp(mod_name, "H5F") == 0 ||
+         strcmp(mod_name, "H5D") == 0 || strcmp(mod_name, "HDF5") == 0))) goto out;
 
     file_path = (const char*)darshan_core_lookup_record_name(record_id);
     json_escape_into(file_esc, sizeof(file_esc), file_path);

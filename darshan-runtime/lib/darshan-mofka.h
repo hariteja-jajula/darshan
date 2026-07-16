@@ -13,10 +13,6 @@ struct darshan_core_runtime;
 
 typedef struct darshanMofkaConnector {
     int mofka_lib;
-    int posix_enable_mofka;
-    int mpiio_enable_mofka;
-    int stdio_enable_mofka;
-    int hdf5_enable_mofka;
 } darshanMofkaConnector;
 
 extern struct darshanMofkaConnector mC;
