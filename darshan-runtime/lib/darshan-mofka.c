@@ -183,10 +183,6 @@ void darshan_mofka_connector_send(uint64_t record_id, int64_t rank,
     t0 = now_ns();
 
     if (g_producer == NULL) goto out;
-    if (!(mod_name &&
-        (strcmp(mod_name, "POSIX") == 0 || strcmp(mod_name, "STDIO") == 0 ||
-         strcmp(mod_name, "MPI-IO") == 0 || strcmp(mod_name, "H5F") == 0 ||
-         strcmp(mod_name, "H5D") == 0 || strcmp(mod_name, "HDF5") == 0))) goto out;
 
     file_path = (const char*)darshan_core_lookup_record_name(record_id);
     json_escape_into(file_esc, sizeof(file_esc), file_path);
