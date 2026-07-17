@@ -44,19 +44,6 @@ struct stream_record
     UT_hash_handle hlink;
 };
 
-struct name_ent
-{
-    uint64_t id;
-    char *name;
-    UT_hash_handle hlink;
-};
-
-struct rank_ent
-{
-    int64_t rank;
-    UT_hash_handle hlink;
-};
-
 struct job_info
 {
     int have_uid;
@@ -309,12 +296,12 @@ static void *decode_hex(const char *hex, size_t expected, size_t *out_len)
 
 static int module_name_to_id(const char *module)
 {
+    int i;
     if(!module) return -1;
-    if(strcmp(module, "POSIX") == 0) return DARSHAN_POSIX_MOD;
-    if(strcmp(module, "STDIO") == 0) return DARSHAN_STDIO_MOD;
-    if(strcmp(module, "MPIIO") == 0 || strcmp(module, "MPI-IO") == 0) return DARSHAN_MPIIO_MOD;
-    if(strcmp(module, "H5F") == 0) return DARSHAN_H5F_MOD;
-    if(strcmp(module, "H5D") == 0) return DARSHAN_H5D_MOD;
+    /* the producer emits "MPIIO" but darshan_module_names[] stores "MPI-IO" */
+    if(strcmp(module, "MPIIO") == 0) return DARSHAN_MPIIO_MOD;
+    for(i = 0; i < DARSHAN_KNOWN_MODULE_COUNT; i++)
+        if(strcmp(module, darshan_module_names[i]) == 0) return i;
     return -1;
 }
 
@@ -331,34 +318,31 @@ static int expected_record_size(int mod_id)
     }
 }
 
-static void add_name(struct name_ent **names, uint64_t id, const char *name)
+/* Build a darshan_name_record_ref directly (the hash darshan_log_put_namehash
+ * consumes), mirroring darshan's own deserializer at darshan-logutils.c:1030-1049.
+ * This replaces the old two-stage id->name / name->ref hashing. */
+static void add_name_record(struct darshan_name_record_ref **hash,
+    uint64_t id, const char *name)
 {
-    struct name_ent *ent;
+    struct darshan_name_record_ref *ref;
+    size_t rec_len;
+
     if(!name || !*name) return;
-    HASH_FIND(hlink, *names, &id, sizeof(id), ent);
-    if(ent) return;
-    ent = calloc(1, sizeof(*ent));
-    if(!ent) return;
-    ent->id = id;
-    ent->name = strdup(name);
-    if(!ent->name)
+    HASH_FIND(hlink, *hash, &id, sizeof(darshan_record_id), ref);
+    if(ref) return;
+
+    rec_len = sizeof(darshan_record_id) + strlen(name) + 1;
+    ref = calloc(1, sizeof(*ref));
+    if(!ref) return;
+    ref->name_record = malloc(rec_len);
+    if(!ref->name_record)
     {
-        free(ent);
+        free(ref);
         return;
     }
-    HASH_ADD(hlink, *names, id, sizeof(ent->id), ent);
-}
-
-static void add_rank(struct rank_ent **ranks, int64_t rank)
-{
-    struct rank_ent *ent;
-    if(rank < 0) return;
-    HASH_FIND(hlink, *ranks, &rank, sizeof(rank), ent);
-    if(ent) return;
-    ent = calloc(1, sizeof(*ent));
-    if(!ent) return;
-    ent->rank = rank;
-    HASH_ADD(hlink, *ranks, rank, sizeof(ent->rank), ent);
+    ref->name_record->id = (darshan_record_id)id;
+    memcpy(ref->name_record->name, name, strlen(name) + 1);
+    HASH_ADD(hlink, *hash, name_record->id, sizeof(darshan_record_id), ref);
 }
 
 static int should_replace(struct stream_record *old, unsigned long long seq, double ended_at)
@@ -447,31 +431,6 @@ static void update_job_info(struct job_info *job, const char *line)
     }
 }
 
-static struct darshan_name_record_ref *build_namehash(struct name_ent *names)
-{
-    struct darshan_name_record_ref *name_hash = NULL;
-    struct name_ent *ent, *tmp;
-
-    HASH_ITER(hlink, names, ent, tmp)
-    {
-        struct darshan_name_record_ref *ref;
-        size_t name_len = strlen(ent->name);
-        ref = calloc(1, sizeof(*ref));
-        if(!ref) continue;
-        ref->name_record = malloc(sizeof(struct darshan_name_record) + name_len);
-        if(!ref->name_record)
-        {
-            free(ref);
-            continue;
-        }
-        ref->name_record->id = ent->id;
-        memcpy(ref->name_record->name, ent->name, name_len + 1);
-        HASH_ADD(hlink, name_hash, name_record->id, sizeof(darshan_record_id), ref);
-    }
-
-    return name_hash;
-}
-
 static void free_namehash(struct darshan_name_record_ref *hash)
 {
     struct darshan_name_record_ref *ref, *tmp;
@@ -480,17 +439,6 @@ static void free_namehash(struct darshan_name_record_ref *hash)
         HASH_DELETE(hlink, hash, ref);
         free(ref->name_record);
         free(ref);
-    }
-}
-
-static void free_names(struct name_ent *names)
-{
-    struct name_ent *ent, *tmp;
-    HASH_ITER(hlink, names, ent, tmp)
-    {
-        HASH_DELETE(hlink, names, ent);
-        free(ent->name);
-        free(ent);
     }
 }
 
@@ -505,19 +453,9 @@ static void free_records(struct stream_record *records)
     }
 }
 
-static void free_ranks(struct rank_ent *ranks)
-{
-    struct rank_ent *ent, *tmp;
-    HASH_ITER(hlink, ranks, ent, tmp)
-    {
-        HASH_DELETE(hlink, ranks, ent);
-        free(ent);
-    }
-}
-
 static int read_events(const char *path, struct stream_record **records,
-    struct name_ent **names, struct rank_ent **ranks, struct job_info *job,
-    unsigned long long *event_count)
+    struct darshan_name_record_ref **name_hash, int64_t *max_rank,
+    struct job_info *job, unsigned long long *event_count)
 {
     FILE *fp;
     char *line = NULL;
@@ -572,8 +510,8 @@ static int read_events(const char *path, struct stream_record **records,
         }
 
         file = json_get_string(line, "file");
-        if(file) add_name(names, record_id, file);
-        add_rank(ranks, rank);
+        if(file) add_name_record(name_hash, record_id, file);
+        if(rank >= 0 && rank > *max_rank) *max_rank = rank;
         add_record(records, mod_id, record_id, rank, buf, len, seq, ended_at);
         (*event_count)++;
 
@@ -608,21 +546,22 @@ static void fill_job(struct darshan_job *out, const struct job_info *in,
     out->end_time_nsec = (int64_t)((end - floor(end)) * 1000000000.0);
 
     snprintf(out->metadata, sizeof(out->metadata),
-        "lib_ver=unknown\nreconstructed_from=mofka_jsonl\npartial=true\nhostname=%s\n",
+        "lib_ver=unknown\nreconstructor_ver=%s\nreconstructed_from=mofka_jsonl\npartial=true\nhostname=%s\n",
+        darshan_log_get_lib_version(),
         in->hostname[0] ? in->hostname : "unknown");
 }
 
 static int write_log(const char *outfile, struct stream_record *records,
-    struct name_ent *names, struct rank_ent *ranks, const struct job_info *job_info)
+    struct darshan_name_record_ref *name_hash, int64_t max_rank,
+    const struct job_info *job_info)
 {
     darshan_fd out;
     struct darshan_job job;
-    struct darshan_name_record_ref *name_hash;
     struct stream_record *rec, *tmp;
     struct darshan_mnt_info mnt;
     uint64_t partial = 0;
     int ret;
-    int64_t nprocs = (int64_t)HASH_CNT(hlink, ranks);
+    int64_t nprocs = max_rank + 1;
 
     HASH_ITER(hlink, records, rec, tmp)
         DARSHAN_MOD_FLAG_SET(partial, rec->key.mod_id);
@@ -647,9 +586,7 @@ static int write_log(const char *outfile, struct stream_record *records,
     ret = darshan_log_put_mounts(out, &mnt, 1);
     if(ret < 0) goto fail;
 
-    name_hash = build_namehash(names);
     ret = darshan_log_put_namehash(out, name_hash);
-    free_namehash(name_hash);
     if(ret < 0) goto fail;
 
     /* Write module records in ascending module-id order. darshan_log_dzwrite
@@ -691,8 +628,8 @@ fail:
 int main(int argc, char **argv)
 {
     struct stream_record *records = NULL;
-    struct name_ent *names = NULL;
-    struct rank_ent *ranks = NULL;
+    struct darshan_name_record_ref *name_hash = NULL;
+    int64_t max_rank = -1;
     struct job_info job;
     unsigned long long event_count = 0;
     int ret;
@@ -705,7 +642,7 @@ int main(int argc, char **argv)
 
     memset(&job, 0, sizeof(job));
 
-    ret = read_events(argv[1], &records, &names, &ranks, &job, &event_count);
+    ret = read_events(argv[1], &records, &name_hash, &max_rank, &job, &event_count);
     if(ret < 0)
         return 1;
 
@@ -713,12 +650,11 @@ int main(int argc, char **argv)
     {
         fprintf(stderr, "Error: no reconstructable module records found in %s\n", argv[1]);
         free_records(records);
-        free_names(names);
-        free_ranks(ranks);
+        free_namehash(name_hash);
         return 1;
     }
 
-    ret = write_log(argv[2], records, names, ranks, &job);
+    ret = write_log(argv[2], records, name_hash, max_rank, &job);
     if(ret == 0)
     {
         fprintf(stderr, "reconstructed %u module records from %llu streamed events into %s\n",
@@ -726,7 +662,6 @@ int main(int argc, char **argv)
     }
 
     free_records(records);
-    free_names(names);
-    free_ranks(ranks);
+    free_namehash(name_hash);
     return ret == 0 ? 0 : 1;
 }

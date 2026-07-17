@@ -24,10 +24,6 @@
 #include <stdatomic.h>
 #include <diaspora/diaspora_c.h>
 
-struct darshanMofkaConnector mC = {
-    .mofka_lib = 1,
-};
-
 static diaspora_driver_t*   g_driver;
 static diaspora_topic_t*    g_topic;
 static diaspora_producer_t* g_producer;
@@ -40,10 +36,9 @@ static long    g_pid;
 static int64_t g_uid   = -1;
 static int64_t g_jobid = -1;
 static double  g_t0_epoch;
+static int     g_timing;   /* cached DARSHAN_MOFKA_TIMING: set once in initialize */
 
 #define MOFKA_JSON_BUF 8192
-#define MOFKA_BATCH_ADAPTIVE ((size_t)0)
-#define MOFKA_BATCH_SIZE     MOFKA_BATCH_ADAPTIVE
 
 static uint64_t now_ns(void)
 {
@@ -54,7 +49,7 @@ static uint64_t now_ns(void)
 
 static void mofka_took(const char* fn, uint64_t t0)
 {
-    if (getenv("DARSHAN_MOFKA_TIMING"))
+    if (g_timing)
         darshan_core_fprintf(stderr, "darshan-mofka[timing] %s %.3f us\n", fn, (now_ns() - t0) / 1e3);
 }
 
@@ -93,6 +88,7 @@ void darshan_mofka_connector_initialize(struct darshan_core_runtime* init_core)
     char pname[64];
     uint64_t t0 = now_ns();
 
+    g_timing = (getenv("DARSHAN_MOFKA_TIMING") != NULL);
     g_pid = (long)(init_core ? init_core->pid : getpid());
 
     if (gethostname(g_hostname, sizeof(g_hostname)) != 0)
@@ -110,7 +106,7 @@ void darshan_mofka_connector_initialize(struct darshan_core_runtime* init_core)
     topic_name = getenv("DARSHAN_MOFKA_TOPIC");
     if (topic_name == NULL || *topic_name == '\0') topic_name = "darshan";
 
-    size_t batch_size = MOFKA_BATCH_SIZE, max_batches = 0;
+    size_t batch_size = 0 /* adaptive */, max_batches = 0;
     { const char* e;
       if ((e = getenv("DARSHAN_MOFKA_BATCH"))       && *e) batch_size  = (size_t)strtoull(e, NULL, 10);
       if ((e = getenv("DARSHAN_MOFKA_MAX_BATCHES"))  && *e) max_batches = (size_t)strtoull(e, NULL, 10); }
@@ -261,33 +257,9 @@ clear:
 
 #else
 
-struct darshanMofkaConnector mC = {
-    .mofka_lib = 0,
-};
-
-void darshan_mofka_connector_initialize(struct darshan_core_runtime* init_core)
-{
-    (void)init_core;
-}
-
-void darshan_mofka_connector_send(uint64_t record_id, int64_t rank,
-                                  int64_t record_count, char* rwo,
-                                  int64_t offset, int64_t length,
-                                  int64_t max_byte, int64_t rw_switch,
-                                  int64_t flushes,
-                                  double start_time, double end_time,
-                                  double total_time,
-                                  char* mod_name, char* data_type,
-                                  const void* rec, uint64_t rec_size)
-{
-    (void)record_id; (void)rank;       (void)record_count; (void)rwo;
-    (void)offset;    (void)length;     (void)max_byte;     (void)rw_switch;
-    (void)flushes;   (void)start_time; (void)end_time;     (void)total_time;
-    (void)mod_name;  (void)data_type;  (void)rec;          (void)rec_size;
-}
-
-void darshan_mofka_connector_finalize(void)
-{
-}
+/* No stub definitions when Mofka is unavailable: darshan-core.c guards the
+ * initialize/finalize calls with #ifdef HAVE_MOFKA and DARSHAN_MOFKA_SEND()
+ * expands to a no-op (see darshan-mofka.h), so none of the connector entry
+ * points are referenced in a !HAVE_MOFKA build. */
 
 #endif /* HAVE_MOFKA */

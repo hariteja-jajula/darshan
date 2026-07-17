@@ -11,12 +11,6 @@
 
 struct darshan_core_runtime;
 
-typedef struct darshanMofkaConnector {
-    int mofka_lib;
-} darshanMofkaConnector;
-
-extern struct darshanMofkaConnector mC;
-
 #ifdef __cplusplus
 extern "C" {
 #endif
