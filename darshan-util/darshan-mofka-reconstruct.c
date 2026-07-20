@@ -23,6 +23,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <sys/stat.h>
+#include <sys/types.h>
 
 #include "uthash-1.9.2/src/uthash.h"
 #include "darshan-logutils.h"
@@ -59,7 +61,12 @@ static int hex_value(int c);   /* fwd decl: used by json_get_string's \u case */
 
 static void usage(const char *prog)
 {
-    fprintf(stderr, "Usage: %s <events.jsonl|-> <job_partial.darshan>\n", prog);
+    fprintf(stderr,
+        "Usage: %s [--per-rank] <events.jsonl|-> <output>\n"
+        "  default:     <output> is a single partial .darshan log (all ranks)\n"
+        "  --per-rank:  <output> is a directory; writes one rank<N>.darshan per\n"
+        "               rank, suitable for `darshan-merge --shared-redux`.\n",
+        prog);
 }
 
 static const char *json_find_key(const char *line, const char *key)
@@ -559,9 +566,16 @@ static void fill_job(struct darshan_job *out, const struct job_info *in,
         in->hostname[0] ? in->hostname : "unknown");
 }
 
+/* Write module records to a single .darshan log.
+ *
+ * rank_filter < 0  : write every rank's records into one log (default mode).
+ * rank_filter >= 0 : write only records for that rank (per-rank mode); the
+ *                    output log's nprocs still reflects the full job so that
+ *                    darshan-merge --shared-redux reduces correctly.
+ */
 static int write_log(const char *outfile, struct stream_record *records,
     struct darshan_name_record_ref *name_hash, int64_t max_rank,
-    const struct job_info *job_info)
+    const struct job_info *job_info, int64_t rank_filter)
 {
     darshan_fd out;
     struct darshan_job job;
@@ -572,7 +586,11 @@ static int write_log(const char *outfile, struct stream_record *records,
     int64_t nprocs = max_rank + 1;
 
     HASH_ITER(hlink, records, rec, tmp)
+    {
+        if(rank_filter >= 0 && rec->key.rank != rank_filter)
+            continue;
         DARSHAN_MOD_FLAG_SET(partial, rec->key.mod_id);
+    }
 
     out = darshan_log_create(outfile, DARSHAN_ZLIB_COMP, partial);
     if(!out)
@@ -613,6 +631,7 @@ static int write_log(const char *outfile, struct stream_record *records,
             HASH_ITER(hlink, records, rec, tmp)
             {
                 if(rec->key.mod_id != m) continue;
+                if(rank_filter >= 0 && rec->key.rank != rank_filter) continue;
                 ret = mod_logutils[m]->log_put_record(out, rec->buf);
                 if(ret < 0)
                 {
@@ -633,6 +652,56 @@ fail:
     return -1;
 }
 
+/* Per-rank mode: write outdir/rank<N>.darshan for every rank that has at least
+ * one record. Each file carries only that rank's records but reports the full
+ * job's nprocs, so the resulting set is a drop-in for:
+ *     darshan-merge --shared-redux --output job.darshan outdir/*.darshan
+ */
+static int write_per_rank(const char *outdir, struct stream_record *records,
+    struct darshan_name_record_ref *name_hash, int64_t max_rank,
+    const struct job_info *job_info)
+{
+    int64_t r;
+    int files = 0;
+
+    if(mkdir(outdir, 0755) != 0 && errno != EEXIST)
+    {
+        fprintf(stderr, "Error: cannot create output directory %s: %s\n",
+            outdir, strerror(errno));
+        return -1;
+    }
+
+    for(r = 0; r <= max_rank; r++)
+    {
+        struct stream_record *rec, *tmp;
+        char path[PATH_MAX];
+        int has = 0;
+
+        /* skip ranks that produced no records */
+        HASH_ITER(hlink, records, rec, tmp)
+        {
+            if(rec->key.rank == r) { has = 1; break; }
+        }
+        if(!has)
+            continue;
+
+        snprintf(path, sizeof(path), "%s/rank%" PRId64 ".darshan", outdir, r);
+        if(write_log(path, records, name_hash, max_rank, job_info, r) != 0)
+            return -1;
+        files++;
+    }
+
+    if(files == 0)
+    {
+        fprintf(stderr, "Error: no rank-tagged records found; nothing written to %s\n", outdir);
+        return -1;
+    }
+
+    fprintf(stderr, "wrote %d per-rank log(s) under %s (nprocs=%" PRId64 ")\n",
+        files, outdir, max_rank + 1);
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     struct stream_record *records = NULL;
@@ -640,34 +709,53 @@ int main(int argc, char **argv)
     int64_t max_rank = -1;
     struct job_info job;
     unsigned long long event_count = 0;
+    int per_rank = 0;
+    int argi = 1;
+    const char *infile, *output;
     int ret;
 
-    if(argc != 3)
+    /* optional --per-rank flag before the two positional args */
+    if(argc >= 2 && strcmp(argv[argi], "--per-rank") == 0)
+    {
+        per_rank = 1;
+        argi++;
+    }
+
+    if(argc - argi != 2)
     {
         usage(argv[0]);
         return 1;
     }
+    infile = argv[argi];
+    output = argv[argi + 1];
 
     memset(&job, 0, sizeof(job));
 
-    ret = read_events(argv[1], &records, &name_hash, &max_rank, &job, &event_count);
+    ret = read_events(infile, &records, &name_hash, &max_rank, &job, &event_count);
     if(ret < 0)
         return 1;
 
     if(HASH_CNT(hlink, records) == 0)
     {
         fprintf(stderr, "Error: no reconstructable module records found in %s\n",
-            strcmp(argv[1], "-") == 0 ? "stdin" : argv[1]);
+            strcmp(infile, "-") == 0 ? "stdin" : infile);
         free_records(records);
         free_namehash(name_hash);
         return 1;
     }
 
-    ret = write_log(argv[2], records, name_hash, max_rank, &job);
-    if(ret == 0)
+    if(per_rank)
     {
-        fprintf(stderr, "reconstructed %u module records from %llu streamed events into %s\n",
-            (unsigned)HASH_CNT(hlink, records), event_count, argv[2]);
+        ret = write_per_rank(output, records, name_hash, max_rank, &job);
+    }
+    else
+    {
+        ret = write_log(output, records, name_hash, max_rank, &job, -1);
+        if(ret == 0)
+        {
+            fprintf(stderr, "reconstructed %u module records from %llu streamed events into %s\n",
+                (unsigned)HASH_CNT(hlink, records), event_count, output);
+        }
     }
 
     free_records(records);
