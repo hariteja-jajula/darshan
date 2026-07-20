@@ -91,5 +91,28 @@ if [ ! -e "$PREFIX/lib/libdarshan.so" ]; then
 fi
 
 echo "=== built: $(ls "$PREFIX"/lib/libdarshan.so* 2>/dev/null | tr '\n' ' ')==="
+
+# --- darshan-util: darshan-parser + darshan-mofka-reconstruct (README step 11) ---
+# Built into the same PREFIX. rpath so the tools load THIS libdarshan-util.so, not
+# an older one that may sit ahead on LD_LIBRARY_PATH (e.g. a system/spack darshan).
+UTIL="$HERE/darshan-util"
+UBUILD="$UTIL/_build"
+[ -f "$UTIL/configure" ] || ( cd "$UTIL" && autoreconf -fi )
+mkdir -p "$UBUILD"
+cd "$UBUILD"
+sh "$UTIL/configure" ${CC:+CC="$CC"} --prefix="$PREFIX" \
+    LDFLAGS="-Wl,-rpath,$PREFIX/lib"
+# make untars the bundled uthash with `tar xjf`; if the bzip2 on PATH is a broken
+# symlink (seen with some spack views), pre-extract with a working bzip2 first.
+if [ ! -d uthash-1.9.2 ]; then
+    for bz in /usr/bin/bzip2 "$(command -v bzip2 2>/dev/null)"; do
+        [ -x "$bz" ] && "$bz" --help >/dev/null 2>&1 || continue
+        tar --use-compress-program="$bz" -xf "$UTIL/extern/uthash-1.9.2.tar.bz2" && break
+    done
+fi
+make -j"$JOBS"
+make install
+
+echo "=== util: $(ls "$PREFIX"/bin/darshan-parser "$PREFIX"/bin/darshan-mofka-reconstruct 2>/dev/null | tr '\n' ' ')==="
 echo "=== install prefix: $PREFIX ==="
 echo "point the harness at it:  export DARSHAN_PREFIX=$PREFIX"
