@@ -1316,8 +1316,12 @@ int DARSHAN_DECL(MPI_File_close)(MPI_File *fh)
         if(dC.ldms_lib)
             if(dC.mpiio_enable_ldms)
                 darshan_ldms_connector_send(rec_ref->file_rec->base_rec.id, rec_ref->file_rec->base_rec.rank, rec_ref->close_counts, "close", -1, -1, -1, -1, -1, tm1, tm2, rec_ref->file_rec->fcounters[MPIIO_F_META_TIME], "MPIIO", "MOD");
-        DARSHAN_MOFKA_SEND(rec_ref->file_rec->base_rec.id, rec_ref->file_rec->base_rec.rank, rec_ref->close_counts, "close", -1, -1, -1, -1, -1, tm1, tm2, rec_ref->file_rec->fcounters[MPIIO_F_META_TIME], "MPIIO", "MOD", (const void*)rec_ref->file_rec, sizeof(*rec_ref->file_rec));
 #endif
+        /* Stream the close event to Mofka. Kept in its own HAVE_MOFKA-guarded
+         * hook (via DARSHAN_MOFKA_SEND, a no-op when Mofka is off), independent
+         * of the LDMS block above. Uses total opens for the count, mirroring the
+         * MPIIO open hook, since close_counts only exists under HAVE_LDMS. */
+        DARSHAN_MOFKA_SEND(rec_ref->file_rec->base_rec.id, rec_ref->file_rec->base_rec.rank, rec_ref->file_rec->counters[MPIIO_COLL_OPENS] + rec_ref->file_rec->counters[MPIIO_INDEP_OPENS], "close", -1, -1, -1, -1, -1, tm1, tm2, rec_ref->file_rec->fcounters[MPIIO_F_META_TIME], "MPIIO", "MOD", (const void*)rec_ref->file_rec, sizeof(*rec_ref->file_rec));
     }
     MPIIO_POST_RECORD();
 
