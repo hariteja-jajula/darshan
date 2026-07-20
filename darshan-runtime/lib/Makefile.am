@@ -113,6 +113,11 @@ endif
 if HAVE_MOFKA
 libdarshan_la_LIBADD += $(MOFKA_LIBS)
 libdarshan_la_CPPFLAGS += $(MOFKA_CFLAGS)
+# The static library (used by the MPI build) also compiles darshan-mofka.c and
+# therefore needs the Mofka/diaspora-c include path; without this the MPI build
+# fails with "diaspora/diaspora_c.h: No such file or directory". (A static
+# archive takes no LIBADD; consumers link MOFKA_LIBS via darshan-config.)
+libdarshan_a_CPPFLAGS += $(MOFKA_CFLAGS)
 endif
 
 H_SRCS = darshan-common.h \
