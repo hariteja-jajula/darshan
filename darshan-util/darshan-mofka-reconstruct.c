@@ -59,7 +59,7 @@ static int hex_value(int c);   /* fwd decl: used by json_get_string's \u case */
 
 static void usage(const char *prog)
 {
-    fprintf(stderr, "Usage: %s <events.jsonl> <job_partial.darshan>\n", prog);
+    fprintf(stderr, "Usage: %s <events.jsonl|-> <job_partial.darshan>\n", prog);
 }
 
 static const char *json_find_key(const char *line, const char *key)
@@ -462,11 +462,18 @@ static int read_events(const char *path, struct stream_record **records,
     size_t cap = 0;
     ssize_t nread;
 
-    fp = fopen(path, "r");
-    if(!fp)
+    if(strcmp(path, "-") == 0)
     {
-        fprintf(stderr, "Error: cannot open %s: %s\n", path, strerror(errno));
-        return -1;
+        fp = stdin;
+    }
+    else
+    {
+        fp = fopen(path, "r");
+        if(!fp)
+        {
+            fprintf(stderr, "Error: cannot open %s: %s\n", path, strerror(errno));
+            return -1;
+        }
     }
 
     while((nread = getline(&line, &cap, fp)) != -1)
@@ -522,7 +529,8 @@ next:
     }
 
     free(line);
-    fclose(fp);
+    if(fp != stdin)
+        fclose(fp);
     return 0;
 }
 
@@ -648,7 +656,8 @@ int main(int argc, char **argv)
 
     if(HASH_CNT(hlink, records) == 0)
     {
-        fprintf(stderr, "Error: no reconstructable module records found in %s\n", argv[1]);
+        fprintf(stderr, "Error: no reconstructable module records found in %s\n",
+            strcmp(argv[1], "-") == 0 ? "stdin" : argv[1]);
         free_records(records);
         free_namehash(name_hash);
         return 1;
