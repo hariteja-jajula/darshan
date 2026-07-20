@@ -110,7 +110,7 @@ if [ ! -d uthash-1.9.2 ]; then
         tar --use-compress-program="$bz" -xf "$UTIL/extern/uthash-1.9.2.tar.bz2" && break
     done
 fi
-make -j"$JOBS"
+make -j"$JOBS" || make -j1   # -j1 fallback for fork-limited/loaded nodes
 make install
 
 echo "=== util: $(ls "$PREFIX"/bin/darshan-parser "$PREFIX"/bin/darshan-mofka-reconstruct 2>/dev/null | tr '\n' ' ')==="
