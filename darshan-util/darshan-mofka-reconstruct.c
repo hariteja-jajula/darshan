@@ -318,6 +318,43 @@ static int expected_record_size(int mod_id)
     }
 }
 
+/* Return 1 if a record should be pruned from the reconstructed log.
+ *
+ * This mirrors native Darshan's own filtering in stdio_output()
+ * (darshan-runtime/lib/darshan-stdio.c): it drops ONLY the <STDIN>/<STDOUT>/
+ * <STDERR> STDIO stream records when they had no read or write activity
+ * (STDIO_READS == 0 && STDIO_WRITES == 0). No other records -- including
+ * regular files and other modules -- are pruned by native Darshan, so we
+ * do not prune them here either.
+ *
+ * We identify the three streams by name rather than by record id: the util
+ * cannot call the runtime's darshan_core_gen_record_id(), and matching the
+ * "<STDIN>"/"<STDOUT>"/"<STDERR>" name Darshan assigns them is equivalent. */
+static int record_is_empty(int mod_id, const void *buf, const char *name)
+{
+    const struct darshan_stdio_file *r;
+
+    if(mod_id != DARSHAN_STDIO_MOD || !name)
+        return 0;
+
+    if(strcmp(name, "<STDIN>") != 0 &&
+       strcmp(name, "<STDOUT>") != 0 &&
+       strcmp(name, "<STDERR>") != 0)
+        return 0;
+
+    r = buf;
+    return (r->counters[STDIO_READS] == 0 && r->counters[STDIO_WRITES] == 0);
+}
+
+/* Look up a record's file name from the name hash by id. */
+static const char *lookup_record_name(struct darshan_name_record_ref *name_hash,
+    uint64_t id)
+{
+    struct darshan_name_record_ref *ref;
+    HASH_FIND(hlink, name_hash, &id, sizeof(darshan_record_id), ref);
+    return ref ? ref->name_record->name : NULL;
+}
+
 /* Build a darshan_name_record_ref directly (the hash darshan_log_put_namehash
  * consumes), mirroring darshan's own deserializer at darshan-logutils.c:1030-1049.
  * This replaces the old two-stage id->name / name->ref hashing. */
@@ -553,7 +590,8 @@ static void fill_job(struct darshan_job *out, const struct job_info *in,
 
 static int write_log(const char *outfile, struct stream_record *records,
     struct darshan_name_record_ref *name_hash, int64_t max_rank,
-    const struct job_info *job_info)
+    const struct job_info *job_info,
+    unsigned *written_out, unsigned *pruned_out)
 {
     darshan_fd out;
     struct darshan_job job;
@@ -564,7 +602,11 @@ static int write_log(const char *outfile, struct stream_record *records,
     int64_t nprocs = max_rank + 1;
 
     HASH_ITER(hlink, records, rec, tmp)
+    {
+        if(record_is_empty(rec->key.mod_id, rec->buf,
+            lookup_record_name(name_hash, rec->key.record_id))) continue;
         DARSHAN_MOD_FLAG_SET(partial, rec->key.mod_id);
+    }
 
     out = darshan_log_create(outfile, DARSHAN_ZLIB_COMP, partial);
     if(!out)
@@ -605,6 +647,13 @@ static int write_log(const char *outfile, struct stream_record *records,
             HASH_ITER(hlink, records, rec, tmp)
             {
                 if(rec->key.mod_id != m) continue;
+                /* prune unused std streams, matching native Darshan */
+                if(record_is_empty(rec->key.mod_id, rec->buf,
+                    lookup_record_name(name_hash, rec->key.record_id)))
+                {
+                    if(pruned_out) (*pruned_out)++;
+                    continue;
+                }
                 ret = mod_logutils[m]->log_put_record(out, rec->buf);
                 if(ret < 0)
                 {
@@ -612,6 +661,7 @@ static int write_log(const char *outfile, struct stream_record *records,
                         rec->key.mod_id, rec->key.record_id);
                     goto fail;
                 }
+                if(written_out) (*written_out)++;
             }
         }
     }
@@ -654,11 +704,16 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    ret = write_log(argv[2], records, name_hash, max_rank, &job);
-    if(ret == 0)
     {
-        fprintf(stderr, "reconstructed %u module records from %llu streamed events into %s\n",
-            (unsigned)HASH_CNT(hlink, records), event_count, argv[2]);
+        unsigned written = 0, pruned = 0;
+        ret = write_log(argv[2], records, name_hash, max_rank, &job,
+            &written, &pruned);
+        if(ret == 0)
+        {
+            fprintf(stderr,
+                "reconstructed %u module records (%u pruned as empty) from %llu streamed events into %s\n",
+                written, pruned, event_count, argv[2]);
+        }
     }
 
     free_records(records);
