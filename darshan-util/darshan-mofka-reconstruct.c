@@ -255,6 +255,28 @@ static int json_get_double(const char *line, const char *key, double *out)
     return 1;
 }
 
+/* Epoch seconds from a key that may be a number OR an ISO datetime string. The
+ * consumer (FlowCept) rewrites started_at/ended_at into "YYYY-MM-DD HH:MM:SS.ffffff"
+ * (UTC), so a plain numeric parse fails; fall back to strptime + timegm + fraction. */
+static int json_get_epoch(const char *line, const char *key, double *out)
+{
+    if(json_get_double(line, key, out)) return 1;   /* still numeric */
+    char *s = json_get_string(line, key);
+    if(!s) return 0;
+    struct tm tm;
+    memset(&tm, 0, sizeof(tm));
+    const char *dot = strchr(s, '.');
+    double frac = dot ? atof(dot) : 0.0;             /* ".ffffff" -> fractional seconds */
+    char *end = strptime(s, "%Y-%m-%dT%H:%M:%S", &tm);
+    if(!end) { memset(&tm, 0, sizeof(tm)); end = strptime(s, "%Y-%m-%d %H:%M:%S", &tm); }
+    free(s);
+    if(!end) return 0;
+    time_t base = timegm(&tm);
+    if(base == (time_t)-1) return 0;
+    *out = (double)base + frac;
+    return 1;
+}
+
 static int hex_value(int c)
 {
     if(c >= '0' && c <= '9') return c - '0';
@@ -446,11 +468,11 @@ static void update_job_info(struct job_info *job, const char *line)
         job->jobid = v;
         job->have_jobid = 1;
     }
-    if(json_get_double(line, "started_at", &d))
+    if(json_get_epoch(line, "started_at", &d))
     {
         if(job->start_time == 0.0 || d < job->start_time) job->start_time = d;
     }
-    if(json_get_double(line, "ended_at", &d))
+    if(json_get_epoch(line, "ended_at", &d))
     {
         if(d > job->end_time) job->end_time = d;
     }
