@@ -39,9 +39,16 @@ static double  g_t0_epoch;
 static int     g_timing;   /* cached DARSHAN_MOFKA_TIMING: set once in initialize */
 
 static const char *g_exemnt = NULL;   /* core's exe+mounts buffer (init_core->log_exemnt_p) */
+static char        g_host_esc[300];   /* g_hostname JSON-escaped once at init (job constant) */
 static int         g_meta_sent;
 
 #define MOFKA_JSON_BUF 8192
+/* Envelope fragments shared verbatim by emit_metadata() and darshan_mofka_send() -- macros
+ * (compile-time concatenation, no hot-path helper) so type/schema_version/identity live in
+ * one place. The differing parts (activity_id, task_id, module/op, rank/seq) stay inline. */
+#define MOFKA_ENV_HEAD   "{\"type\":\"task\","
+#define MOFKA_ENV_SCHEMA "\"schema\":\"darshan_runtime\",\"schema_version\":2,"
+#define MOFKA_ENV_IDENT  "\"hostname\":\"%s\",\"pid\":%ld,\"uid\":%lld,\"job_id\":%lld,"
 
 static void mofka_took(const char* fn, double t0)
 {
@@ -86,24 +93,23 @@ static void hex_into(char* dst, size_t dstsz, const void* src, uint64_t n)
 static void emit_metadata(void)
 {
     char buf[9216];
-    char host_esc[300], exemnt_esc[8192];
+    char exemnt_esc[8192];
     int n;
 
     if (g_producer == NULL) return;
 
-    json_escape_into(host_esc, sizeof(host_esc), g_hostname);
     json_escape_into(exemnt_esc, sizeof(exemnt_esc), g_exemnt);
 
     n = snprintf(buf, sizeof(buf),
-        "{\"type\":\"task\","
+        MOFKA_ENV_HEAD
         "\"activity_id\":\"darshan_meta\","
         "\"task_id\":\"darshan-meta-%ld-%lld\","
-        "\"schema\":\"darshan_runtime\",\"schema_version\":2,"
+        MOFKA_ENV_SCHEMA
         "\"event_type\":\"metadata\","
-        "\"hostname\":\"%s\",\"pid\":%ld,\"uid\":%lld,\"job_id\":%lld,"
+        MOFKA_ENV_IDENT
         "\"t0_epoch\":%.6f,\"exemnt\":\"%s\"}",
         g_pid, (long long)g_jobid,
-        host_esc, g_pid, (long long)g_uid, (long long)g_jobid,
+        g_host_esc, g_pid, (long long)g_uid, (long long)g_jobid,
         g_t0_epoch, exemnt_esc);
 
     if (n < 0 || (size_t)n >= sizeof(buf)) return;  /* too big: skip metadata */
@@ -141,11 +147,16 @@ void darshan_mofka_connector_initialize(struct darshan_core_runtime* init_core)
         snprintf(g_hostname, sizeof(g_hostname), "unknown");
     g_hostname[sizeof(g_hostname) - 1] = '\0';
 
-    g_t0_epoch = darshan_core_wtime_absolute();
+    json_escape_into(g_host_esc, sizeof(g_host_esc), g_hostname);  /* once, not per send (C3) */
 
+    /* Prefer the job's real start time -- it matches the native log's start_time and avoids
+     * the RDTSCP counter darshan_core_wtime_absolute() can hand back as an epoch (C4). */
+    g_t0_epoch = darshan_core_wtime_absolute();
     if (init_core && init_core->log_job_p) {
-        g_uid   = (int64_t)init_core->log_job_p->uid;
-        g_jobid = (int64_t)init_core->log_job_p->jobid;
+        g_uid      = (int64_t)init_core->log_job_p->uid;
+        g_jobid    = (int64_t)init_core->log_job_p->jobid;
+        g_t0_epoch = (double)init_core->log_job_p->start_time_sec
+                   + (double)init_core->log_job_p->start_time_nsec / 1e9;
     }
     if (init_core)
         g_exemnt = init_core->log_exemnt_p;
@@ -214,7 +225,6 @@ void darshan_mofka_connector_send(uint64_t record_id, int64_t rank,
 {
     char buf[MOFKA_JSON_BUF];
     char file_esc[1024];
-    char host_esc[300];
     const char* file_path;
     unsigned long long seq;
     double t0;
@@ -234,7 +244,6 @@ void darshan_mofka_connector_send(uint64_t record_id, int64_t rank,
 
     file_path = (const char*)darshan_core_lookup_record_name(record_id);
     json_escape_into(file_esc, sizeof(file_esc), file_path);
-    json_escape_into(host_esc, sizeof(host_esc), g_hostname);
     seq = (unsigned long long)atomic_fetch_add(&g_seq, 1);
 
     { struct timespec s = darshan_core_abs_timespec_from_wtime(start_time);
@@ -247,13 +256,13 @@ void darshan_mofka_connector_send(uint64_t record_id, int64_t rank,
         hex_into(rec_hex, sizeof(rec_hex), rec, rec_size);
 
     n = snprintf(buf, sizeof(buf),
-        "{\"type\":\"task\","
+        MOFKA_ENV_HEAD
         "\"activity_id\":\"darshan_%s\","
         "\"task_id\":\"darshan-%016llx-%ld-%llu\","
-        "\"schema\":\"darshan_runtime\",\"schema_version\":2,"
+        MOFKA_ENV_SCHEMA
         "\"module\":\"%s\",\"event_type\":\"%s\",\"op\":\"%s\","
         "\"record_id\":\"%016llx\",\"file\":\"%s\","
-        "\"hostname\":\"%s\",\"pid\":%ld,\"uid\":%lld,\"job_id\":%lld,"
+        MOFKA_ENV_IDENT
         "\"rank\":%lld,\"seq\":%llu,\"t0_epoch\":%.6f,"
         "\"cnt\":%lld,\"off\":%lld,\"len\":%lld,\"max_byte\":%lld,"
         "\"switches\":%lld,\"flushes\":%lld,"
@@ -265,7 +274,7 @@ void darshan_mofka_connector_send(uint64_t record_id, int64_t rank,
         data_type ? data_type : "?",
         rwo ? rwo : "?",
         (unsigned long long)record_id, file_esc,
-        host_esc, g_pid, (long long)g_uid, (long long)g_jobid,
+        g_host_esc, g_pid, (long long)g_uid, (long long)g_jobid,
         (long long)rank, seq, g_t0_epoch,
         (long long)record_count, (long long)offset, (long long)length,
         (long long)max_byte, (long long)rw_switch, (long long)flushes,
