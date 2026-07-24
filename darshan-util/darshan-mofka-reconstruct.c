@@ -53,8 +53,7 @@ struct job_info
     double start_time;
     double end_time;
     char hostname[256];
-    char exe[512];        /* argv joined, from the connector metadata event */
-    char mounts[4096];    /* "mountpoint fstype;..." from the metadata event */
+    char exemnt[4096];    /* core's exe+mounts buffer: "<exe>\n<type>\t<path>..." */
 };
 
 static int hex_value(int c);   /* fwd decl: used by json_get_string's \u case */
@@ -486,19 +485,12 @@ static void update_job_info(struct job_info *job, const char *line)
         free(s);
     }
 
-    /* exe + mounts arrive once, on the connector's metadata event */
-    s = json_get_string(line, "exe");
+    /* exe + mounts arrive once, on the connector's metadata event (core format) */
+    s = json_get_string(line, "exemnt");
     if(s)
     {
-        if(job->exe[0] == '\0')
-            snprintf(job->exe, sizeof(job->exe), "%s", s);
-        free(s);
-    }
-    s = json_get_string(line, "mounts");
-    if(s)
-    {
-        if(job->mounts[0] == '\0')
-            snprintf(job->mounts, sizeof(job->mounts), "%s", s);
+        if(job->exemnt[0] == '\0')
+            snprintf(job->exemnt, sizeof(job->exemnt), "%s", s);
         free(s);
     }
 }
@@ -723,35 +715,37 @@ static int write_log(const char *outfile, struct stream_record *records,
     ret = darshan_log_put_job(out, &job);
     if(ret < 0) goto fail;
 
-    ret = darshan_log_put_exe(out,
-        job_info->exe[0] ? (char *)job_info->exe
-                         : "reconstructed-from-mofka-stream");
-    if(ret < 0) goto fail;
-
-    /* Rebuild the mount table from the streamed "mountpoint fstype;..." list.
-     * darshan_log_put_mounts wants them longest-path-first (that is the order
-     * /proc/mounts is emitted in, roughly), so pass them through as-is; fall
-     * back to a single unknown "/" entry if no metadata event was captured. */
+    /* exemnt is core's job buffer: the exe command line, then one
+     * "<fstype>\t<mount point>" per line (darshan_get_exe_and_mounts / add_entry). */
     {
+        char tmp[sizeof(job_info->exemnt)];
         struct darshan_mnt_info mnts[64];
         int nmnt = 0;
-        if(job_info->mounts[0])
+        char *mstr = NULL, *nl;
+
+        snprintf(tmp, sizeof(tmp), "%s", job_info->exemnt);
+        nl = strchr(tmp, '\n');
+        if(nl) { *nl = '\0'; mstr = nl + 1; }
+
+        ret = darshan_log_put_exe(out,
+            tmp[0] ? tmp : "reconstructed-from-mofka-stream");
+        if(ret < 0) goto fail;
+
+        if(mstr)
         {
-            char tmp[sizeof(job_info->mounts)];
             char *save = NULL, *entry;
-            snprintf(tmp, sizeof(tmp), "%s", job_info->mounts);
-            for(entry = strtok_r(tmp, ";", &save);
+            for(entry = strtok_r(mstr, "\n", &save);
                 entry && nmnt < (int)(sizeof(mnts)/sizeof(mnts[0]));
-                entry = strtok_r(NULL, ";", &save))
+                entry = strtok_r(NULL, "\n", &save))
             {
-                char *sp = strchr(entry, ' ');
-                if(!sp) continue;
-                *sp = '\0';
+                char *tab = strchr(entry, '\t');
+                if(!tab) continue;
+                *tab = '\0';
                 memset(&mnts[nmnt], 0, sizeof(mnts[nmnt]));
-                snprintf(mnts[nmnt].mnt_path, sizeof(mnts[nmnt].mnt_path),
-                    "%s", entry);
                 snprintf(mnts[nmnt].mnt_type, sizeof(mnts[nmnt].mnt_type),
-                    "%s", sp + 1);
+                    "%s", entry);
+                snprintf(mnts[nmnt].mnt_path, sizeof(mnts[nmnt].mnt_path),
+                    "%s", tab + 1);
                 nmnt++;
             }
         }
