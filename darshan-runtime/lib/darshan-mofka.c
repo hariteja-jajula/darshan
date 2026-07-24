@@ -38,6 +38,10 @@ static int64_t g_jobid = -1;
 static double  g_t0_epoch;
 static int     g_timing;   /* cached DARSHAN_MOFKA_TIMING: set once in initialize */
 
+static char    g_exe[512];      /* /proc/self/cmdline, argv joined with spaces */
+static char    g_mounts[4096];  /* "mountpoint fstype;..." from /proc/mounts */
+static int     g_meta_sent;     /* the one-shot exe+mounts metadata event guard */
+
 #define MOFKA_JSON_BUF 8192
 
 static uint64_t now_ns(void)
@@ -79,6 +83,77 @@ static void hex_into(char* dst, size_t dstsz, const void* src, uint64_t n)
     dst[o] = '\0';
 }
 
+/* Read this process's command line and mount table once, so the reconstructor
+ * can fill in the exe + mount entries that native Darshan records. Both are
+ * job-level constants, so they ride a single metadata event (emit_metadata),
+ * never per-op -- keeping the streamed volume (and the overhead study) clean. */
+static void read_self_meta(void)
+{
+    FILE* f;
+    size_t i, n = 0;
+
+    f = fopen("/proc/self/cmdline", "rb");
+    if (f) {
+        n = fread(g_exe, 1, sizeof(g_exe) - 1, f);
+        fclose(f);
+        for (i = 0; i < n; i++) if (g_exe[i] == '\0') g_exe[i] = ' ';
+        g_exe[n] = '\0';
+        while (n > 0 && g_exe[n - 1] == ' ') g_exe[--n] = '\0';
+    }
+    if (g_exe[0] == '\0') snprintf(g_exe, sizeof(g_exe), "unknown");
+
+    f = fopen("/proc/mounts", "r");
+    if (f) {
+        char line[600];
+        size_t off = 0;
+        while (fgets(line, sizeof(line), f)) {
+            char dev[256], mp[256], fstype[64];
+            int w;
+            if (sscanf(line, "%255s %255s %63s", dev, mp, fstype) != 3) continue;
+            w = snprintf(g_mounts + off, sizeof(g_mounts) - off,
+                    "%s%s %s", off ? ";" : "", mp, fstype);
+            if (w < 0 || (size_t)w >= sizeof(g_mounts) - off) break; /* full */
+            off += (size_t)w;
+        }
+        fclose(f);
+    }
+}
+
+/* One-shot: stream exe + mounts as a standalone metadata event (no module /
+ * record_id, so the reconstructor's update_job_info picks it up and read_events
+ * otherwise skips it). Bulky mounts would overflow the shared record buffer, so
+ * this gets its own message. */
+static void emit_metadata(void)
+{
+    char buf[MOFKA_JSON_BUF];
+    char host_esc[300], exe_esc[600], mnt_esc[4200];
+    int n;
+
+    if (g_producer == NULL) return;
+
+    json_escape_into(host_esc, sizeof(host_esc), g_hostname);
+    json_escape_into(exe_esc, sizeof(exe_esc), g_exe);
+    json_escape_into(mnt_esc, sizeof(mnt_esc), g_mounts);
+
+    n = snprintf(buf, sizeof(buf),
+        "{\"type\":\"task\","
+        "\"activity_id\":\"darshan_meta\","
+        "\"task_id\":\"darshan-meta-%ld-%lld\","
+        "\"schema\":\"darshan_runtime\",\"schema_version\":2,"
+        "\"event_type\":\"metadata\","
+        "\"hostname\":\"%s\",\"pid\":%ld,\"uid\":%lld,\"job_id\":%lld,"
+        "\"t0_epoch\":%.6f,\"exe\":\"%s\",\"mounts\":\"%s\"}",
+        g_pid, (long long)g_jobid,
+        host_esc, g_pid, (long long)g_uid, (long long)g_jobid,
+        g_t0_epoch, exe_esc, mnt_esc);
+
+    if (n < 0 || (size_t)n >= sizeof(buf)) return;  /* too big: skip metadata */
+
+    if (diaspora_producer_push(g_producer, buf, NULL, 0) != DIASPORA_C_OK)
+        darshan_core_fprintf(stderr, "darshan-mofka: metadata push failed (%s)\n",
+                diaspora_c_last_error());
+}
+
 void darshan_mofka_connector_initialize(struct darshan_core_runtime* init_core)
 {
     const char* group_file;
@@ -101,6 +176,8 @@ void darshan_mofka_connector_initialize(struct darshan_core_runtime* init_core)
         g_uid   = (int64_t)init_core->log_job_p->uid;
         g_jobid = (int64_t)init_core->log_job_p->jobid;
     }
+
+    read_self_meta();
 
     group_file = getenv("DARSHAN_MOFKA_GROUP_FILE");
     topic_name = getenv("DARSHAN_MOFKA_TOPIC");
@@ -179,6 +256,8 @@ void darshan_mofka_connector_send(uint64_t record_id, int64_t rank,
     t0 = now_ns();
 
     if (g_producer == NULL) goto out;
+
+    if (!g_meta_sent) { g_meta_sent = 1; emit_metadata(); }
 
     file_path = (const char*)darshan_core_lookup_record_name(record_id);
     json_escape_into(file_esc, sizeof(file_esc), file_path);

@@ -53,6 +53,8 @@ struct job_info
     double start_time;
     double end_time;
     char hostname[256];
+    char exe[512];        /* argv joined, from the connector metadata event */
+    char mounts[4096];    /* "mountpoint fstype;..." from the metadata event */
 };
 
 static int hex_value(int c);   /* fwd decl: used by json_get_string's \u case */
@@ -488,6 +490,22 @@ static void update_job_info(struct job_info *job, const char *line)
         }
         free(s);
     }
+
+    /* exe + mounts arrive once, on the connector's metadata event */
+    s = json_get_string(line, "exe");
+    if(s)
+    {
+        if(job->exe[0] == '\0')
+            snprintf(job->exe, sizeof(job->exe), "%s", s);
+        free(s);
+    }
+    s = json_get_string(line, "mounts");
+    if(s)
+    {
+        if(job->mounts[0] == '\0')
+            snprintf(job->mounts, sizeof(job->mounts), "%s", s);
+        free(s);
+    }
 }
 
 static void free_namehash(struct darshan_name_record_ref *hash)
@@ -710,14 +728,51 @@ static int write_log(const char *outfile, struct stream_record *records,
     ret = darshan_log_put_job(out, &job);
     if(ret < 0) goto fail;
 
-    ret = darshan_log_put_exe(out, "reconstructed-from-mofka-stream");
+    ret = darshan_log_put_exe(out,
+        job_info->exe[0] ? (char *)job_info->exe
+                         : "reconstructed-from-mofka-stream");
     if(ret < 0) goto fail;
 
-    memset(&mnt, 0, sizeof(mnt));
-    snprintf(mnt.mnt_type, sizeof(mnt.mnt_type), "unknown");
-    snprintf(mnt.mnt_path, sizeof(mnt.mnt_path), "/");
-    ret = darshan_log_put_mounts(out, &mnt, 1);
-    if(ret < 0) goto fail;
+    /* Rebuild the mount table from the streamed "mountpoint fstype;..." list.
+     * darshan_log_put_mounts wants them longest-path-first (that is the order
+     * /proc/mounts is emitted in, roughly), so pass them through as-is; fall
+     * back to a single unknown "/" entry if no metadata event was captured. */
+    {
+        struct darshan_mnt_info mnts[64];
+        int nmnt = 0;
+        if(job_info->mounts[0])
+        {
+            char tmp[sizeof(job_info->mounts)];
+            char *save = NULL, *entry;
+            snprintf(tmp, sizeof(tmp), "%s", job_info->mounts);
+            for(entry = strtok_r(tmp, ";", &save);
+                entry && nmnt < (int)(sizeof(mnts)/sizeof(mnts[0]));
+                entry = strtok_r(NULL, ";", &save))
+            {
+                char *sp = strchr(entry, ' ');
+                if(!sp) continue;
+                *sp = '\0';
+                memset(&mnts[nmnt], 0, sizeof(mnts[nmnt]));
+                snprintf(mnts[nmnt].mnt_path, sizeof(mnts[nmnt].mnt_path),
+                    "%s", entry);
+                snprintf(mnts[nmnt].mnt_type, sizeof(mnts[nmnt].mnt_type),
+                    "%s", sp + 1);
+                nmnt++;
+            }
+        }
+        if(nmnt == 0)
+        {
+            memset(&mnt, 0, sizeof(mnt));
+            snprintf(mnt.mnt_type, sizeof(mnt.mnt_type), "unknown");
+            snprintf(mnt.mnt_path, sizeof(mnt.mnt_path), "/");
+            ret = darshan_log_put_mounts(out, &mnt, 1);
+        }
+        else
+        {
+            ret = darshan_log_put_mounts(out, mnts, nmnt);
+        }
+        if(ret < 0) goto fail;
+    }
 
     ret = darshan_log_put_namehash(out, name_hash);
     if(ret < 0) goto fail;
