@@ -512,6 +512,51 @@ static void free_records(struct stream_record *records)
     }
 }
 
+/* ---- HEATMAP reconstruction ---------------------------------------------
+ * Darshan's runtime builds a per-rank HEATMAP record for each active module by
+ * time-binning every read/write op (darshan-runtime/lib/darshan-heatmap.c).
+ * The stream carries one event per op (op/len/started_at/ended_at), so we can
+ * rebuild the same records: capture ops during read_events, then bin them with
+ * the same algorithm (0.1s bins, doubling until <=200 bins fit, byte volume
+ * apportioned across bins weighted by time overlap). The bin constants live in
+ * the runtime .c (off the util include path), so mirror them here. */
+#define HM_MAX_BINS          200
+#define HM_INITIAL_BIN_WIDTH 0.1
+
+struct hm_op {
+    int mod_id;
+    int64_t rank;
+    int is_write;
+    int64_t bytes;
+    double start_abs;
+    double end_abs;
+};
+static struct hm_op *g_hm_ops = NULL;
+static size_t g_hm_n = 0, g_hm_cap = 0;
+
+static void hm_capture(int mod_id, int64_t rank, int is_write, int64_t bytes,
+    double start_abs, double end_abs)
+{
+    struct hm_op *o;
+    if(bytes <= 0 || start_abs <= 0.0) return;
+    if(end_abs < start_abs) end_abs = start_abs;
+    if(g_hm_n == g_hm_cap)
+    {
+        size_t ncap = g_hm_cap ? g_hm_cap * 2 : 256;
+        struct hm_op *n = realloc(g_hm_ops, ncap * sizeof(*n));
+        if(!n) return;
+        g_hm_ops = n;
+        g_hm_cap = ncap;
+    }
+    o = &g_hm_ops[g_hm_n++];
+    o->mod_id = mod_id;
+    o->rank = rank;
+    o->is_write = is_write;
+    o->bytes = bytes;
+    o->start_abs = start_abs;
+    o->end_abs = end_abs;
+}
+
 static int read_events(const char *path, struct stream_record **records,
     struct darshan_name_record_ref **name_hash, int64_t *max_rank,
     struct job_info *job, unsigned long long *event_count)
@@ -551,6 +596,30 @@ static int read_events(const char *path, struct stream_record **records,
         json_get_i64(line, "rec_size", &rec_size_i);
         { uint64_t seq_u = 0; if(json_get_u64(line, "seq", &seq_u)) seq = (unsigned long long)seq_u; }
         json_get_double(line, "ended_at", &ended_at);
+
+        /* HEATMAP: capture every read/write op for later time-binning, even if
+         * the module record below is filtered out by rec_size. Only the modules
+         * that Darshan populates a heatmap for (POSIX/MPI-IO/STDIO). */
+        if(mod_id == DARSHAN_POSIX_MOD || mod_id == DARSHAN_STDIO_MOD ||
+           mod_id == DARSHAN_MPIIO_MOD)
+        {
+            char *op = json_get_string(line, "op");
+            if(op)
+            {
+                int is_w = strstr(op, "write") != NULL;
+                int is_r = strstr(op, "read") != NULL;
+                if(is_w || is_r)
+                {
+                    int64_t nbytes = 0;
+                    double s = 0.0, e = 0.0;
+                    json_get_i64(line, "len", &nbytes);
+                    json_get_epoch(line, "started_at", &s);
+                    json_get_epoch(line, "ended_at", &e);
+                    hm_capture(mod_id, rank, is_w, nbytes, s, e);
+                }
+                free(op);
+            }
+        }
 
         exp_size = expected_record_size(mod_id);
         if(exp_size <= 0) goto next;
@@ -697,6 +766,136 @@ fail:
     return -1;
 }
 
+/* Canonical Darshan record ids for the per-module heatmap name records. These
+ * are the fixed darshan_core_gen_record_id("heatmap:<MOD>") values, and pydarshan
+ * hard-codes the same map (report.read_all_heatmap_records) to resolve a heatmap
+ * record back to its submodule; using anything else makes it fall back to the
+ * raw integer id and the HTML summary crashes. Keep in sync with that map. */
+static uint64_t heatmap_ident(int mod_id, const char **name_out)
+{
+    switch(mod_id)
+    {
+        case DARSHAN_POSIX_MOD: *name_out = "heatmap:POSIX"; return 16592106915301738621ULL;
+        case DARSHAN_STDIO_MOD: *name_out = "heatmap:STDIO"; return 3989511027826779520ULL;
+        case DARSHAN_MPIIO_MOD: *name_out = "heatmap:MPIIO"; return 3668870418325792824ULL;
+        default:                *name_out = NULL;            return 0;
+    }
+}
+
+/* Build one HEATMAP record per (module, rank) seen in the op stream and add it
+ * to the record + name hashes so write_log emits it like any other record. */
+static void build_heatmap_records(struct stream_record **records,
+    struct darshan_name_record_ref **name_hash, const struct job_info *job)
+{
+    double t0 = job->start_time;
+    size_t i, j;
+    char *done;
+
+    if(g_hm_n == 0 || t0 <= 0.0)
+    {
+        free(g_hm_ops);
+        g_hm_ops = NULL; g_hm_n = g_hm_cap = 0;
+        return;
+    }
+    done = calloc(g_hm_n, 1);
+    if(!done) return;
+
+    for(i = 0; i < g_hm_n; i++)
+    {
+        int mod_id = g_hm_ops[i].mod_id;
+        int64_t rank = g_hm_ops[i].rank;
+        double max_end = 0.0, bin_width = HM_INITIAL_BIN_WIDTH;
+        int nbins, b;
+        size_t bufsz;
+        char *hbuf;
+        struct darshan_heatmap_record *hr;
+        int64_t *wb, *rb;
+        const char *hmname = NULL;
+        uint64_t id;
+
+        if(done[i]) continue;
+        id = heatmap_ident(mod_id, &hmname);
+        if(!hmname) { done[i] = 1; continue; }  /* module has no heatmap */
+
+        /* pass 1: latest op end time (relative to job start) for this group */
+        for(j = i; j < g_hm_n; j++)
+        {
+            double e;
+            if(g_hm_ops[j].mod_id != mod_id || g_hm_ops[j].rank != rank) continue;
+            e = g_hm_ops[j].end_abs - t0;
+            if(e > max_end) max_end = e;
+        }
+        if(max_end < 0.0) max_end = 0.0;
+
+        /* choose bin width like the runtime: double until <= MAX bins fit */
+        while(max_end > bin_width * HM_MAX_BINS)
+            bin_width *= 2.0;
+        nbins = (int)ceil(max_end / bin_width);
+        if(nbins < 1) nbins = 1;
+        if(nbins > HM_MAX_BINS) nbins = HM_MAX_BINS;
+
+        bufsz = sizeof(struct darshan_heatmap_record)
+              + (size_t)nbins * 2 * sizeof(int64_t);
+        hbuf = calloc(1, bufsz);
+        if(!hbuf) break;
+        hr = (struct darshan_heatmap_record *)hbuf;
+        wb = (int64_t *)(hbuf + sizeof(struct darshan_heatmap_record));
+        rb = wb + nbins;
+
+        /* pass 2: apportion each op's bytes across the bins it spans, weighted
+         * by time overlap (mirrors darshan_heatmap_update) */
+        for(j = i; j < g_hm_n; j++)
+        {
+            double s, e, dur;
+            int64_t *bins;
+            int b0, b1;
+            if(g_hm_ops[j].mod_id != mod_id || g_hm_ops[j].rank != rank) continue;
+            done[j] = 1;
+            s = g_hm_ops[j].start_abs - t0; if(s < 0.0) s = 0.0;
+            e = g_hm_ops[j].end_abs - t0;   if(e < s) e = s;
+            dur = e - s;
+            bins = g_hm_ops[j].is_write ? wb : rb;
+            b0 = (int)(s / bin_width);
+            b1 = (int)(e / bin_width);
+            if(b0 < 0) b0 = 0;
+            if(b1 >= nbins) b1 = nbins - 1;
+            if(b0 > b1) b0 = b1;
+            if(dur <= 0.0)
+            {
+                bins[b0] += g_hm_ops[j].bytes;
+            }
+            else
+            {
+                for(b = b0; b <= b1; b++)
+                {
+                    double bs = b * bin_width, be = (b + 1) * bin_width;
+                    double lo = s > bs ? s : bs;
+                    double hi = e < be ? e : be;
+                    double sec = hi - lo;
+                    if(sec <= 0.0) continue;
+                    bins[b] += (int64_t)(
+                        (double)g_hm_ops[j].bytes * sec / dur + 0.5);
+                }
+            }
+        }
+
+        hr->bin_width_seconds = bin_width;
+        hr->nbins = nbins;
+        hr->write_bins = wb;   /* fixed up on read; set for local consistency */
+        hr->read_bins = rb;
+        hr->base_rec.id = id;
+        hr->base_rec.rank = rank;
+
+        add_name_record(name_hash, id, hmname);
+        /* add_record takes ownership of hbuf */
+        add_record(records, DARSHAN_HEATMAP_MOD, id, rank, hbuf, bufsz, 1, 0.0);
+    }
+
+    free(done);
+    free(g_hm_ops);
+    g_hm_ops = NULL; g_hm_n = g_hm_cap = 0;
+}
+
 int main(int argc, char **argv)
 {
     struct stream_record *records = NULL;
@@ -717,6 +916,9 @@ int main(int argc, char **argv)
     ret = read_events(argv[1], &records, &name_hash, &max_rank, &job, &event_count);
     if(ret < 0)
         return 1;
+
+    /* rebuild per-module HEATMAP records from the captured op stream */
+    build_heatmap_records(&records, &name_hash, &job);
 
     if(HASH_CNT(hlink, records) == 0)
     {
