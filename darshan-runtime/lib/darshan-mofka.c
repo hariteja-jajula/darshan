@@ -166,6 +166,18 @@ void darshan_mofka_connector_initialize(struct darshan_core_runtime* init_core)
     g_timing = (getenv("DARSHAN_MOFKA_TIMING") != NULL);
     g_pid = (long)(init_core ? init_core->pid : getpid());
 
+    /* Honor the connector's own enable flag: DARSHAN_MOFKA_ENABLE=0 leaves
+     * Darshan recording but sets up no producer, so nothing streams -- the
+     * runtime-only baseline for the overhead study. (Absent keeps the historical
+     * "stream if a group file is set" behavior; only an explicit 0 disables.) */
+    {
+        const char* en = getenv("DARSHAN_MOFKA_ENABLE");
+        if (en && strcmp(en, "0") == 0) {
+            mofka_took("initialize", t0);
+            return;
+        }
+    }
+
     if (gethostname(g_hostname, sizeof(g_hostname)) != 0)
         snprintf(g_hostname, sizeof(g_hostname), "unknown");
     g_hostname[sizeof(g_hostname) - 1] = '\0';
