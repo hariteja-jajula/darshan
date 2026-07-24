@@ -71,21 +71,29 @@ static const char *json_find_key(const char *line, const char *key)
     return strstr(line, needle);
 }
 
-static char *json_get_string(const char *line, const char *key)
+/* Return a pointer to a key's value, positioned just past the ':' and any
+ * whitespace, or NULL if the key (or its colon) is absent. Shared prologue for
+ * all the json_get_* scalar/string extractors. */
+static const char *json_find_value(const char *line, const char *key)
 {
     const char *p = json_find_key(line, key);
-    const char *s;
-    char *out;
-    size_t cap, n;
-
     if(!p) return NULL;
     p = strchr(p, ':');
     if(!p) return NULL;
     p++;
     while(*p && isspace((unsigned char)*p)) p++;
+    return p;
+}
+
+static char *json_get_string(const char *line, const char *key)
+{
+    const char *p = json_find_value(line, key);
+    char *out;
+    size_t cap, n;
+
+    if(!p) return NULL;
     if(*p != '"') return NULL;
     p++;
-    s = p;
 
     cap = strlen(p) + 1;
     out = malloc(cap);
@@ -180,22 +188,17 @@ static char *json_get_string(const char *line, const char *key)
         }
     }
 
-    (void)s;
     out[n] = '\0';
     return out;
 }
 
 static int json_get_i64(const char *line, const char *key, int64_t *out)
 {
-    const char *p = json_find_key(line, key);
+    const char *p = json_find_value(line, key);
     char *end = NULL;
     long long v;
 
     if(!p) return 0;
-    p = strchr(p, ':');
-    if(!p) return 0;
-    p++;
-    while(*p && isspace((unsigned char)*p)) p++;
     v = strtoll(p, &end, 10);
     if(end == p) return 0;
     *out = (int64_t)v;
@@ -204,15 +207,11 @@ static int json_get_i64(const char *line, const char *key, int64_t *out)
 
 static int json_get_u64(const char *line, const char *key, uint64_t *out)
 {
-    const char *p = json_find_key(line, key);
+    const char *p = json_find_value(line, key);
     char *end = NULL;
     unsigned long long v;
 
     if(!p) return 0;
-    p = strchr(p, ':');
-    if(!p) return 0;
-    p++;
-    while(*p && isspace((unsigned char)*p)) p++;
     v = strtoull(p, &end, 10);
     if(end == p) return 0;
     *out = (uint64_t)v;
@@ -242,15 +241,11 @@ static int json_get_u64_hex_or_dec(const char *line, const char *key, uint64_t *
 
 static int json_get_double(const char *line, const char *key, double *out)
 {
-    const char *p = json_find_key(line, key);
+    const char *p = json_find_value(line, key);
     char *end = NULL;
     double v;
 
     if(!p) return 0;
-    p = strchr(p, ':');
-    if(!p) return 0;
-    p++;
-    while(*p && isspace((unsigned char)*p)) p++;
     v = strtod(p, &end);
     if(end == p) return 0;
     *out = v;
