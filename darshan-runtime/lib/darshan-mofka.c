@@ -43,17 +43,11 @@ static int         g_meta_sent;
 
 #define MOFKA_JSON_BUF 8192
 
-static uint64_t now_ns(void)
-{
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
-}
-
-static void mofka_took(const char* fn, uint64_t t0)
+static void mofka_took(const char* fn, double t0)
 {
     if (g_timing)
-        darshan_core_fprintf(stderr, "darshan-mofka[timing] %s %.3f us\n", fn, (now_ns() - t0) / 1e3);
+        darshan_core_fprintf(stderr, "darshan-mofka[timing] %s %.3f us\n",
+            fn, (darshan_core_wtime() - t0) * 1e6);
 }
 
 static void json_escape_into(char* dst, size_t dstsz, const char* src)
@@ -126,7 +120,7 @@ void darshan_mofka_connector_initialize(struct darshan_core_runtime* init_core)
     char opts[1200];
     char gf_esc[1024];
     char pname[64];
-    uint64_t t0 = now_ns();
+    double t0 = darshan_core_wtime();
 
     g_timing = (getenv("DARSHAN_MOFKA_TIMING") != NULL);
     g_pid = (long)(init_core ? init_core->pid : getpid());
@@ -223,19 +217,18 @@ void darshan_mofka_connector_send(uint64_t record_id, int64_t rank,
     char host_esc[300];
     const char* file_path;
     unsigned long long seq;
-    uint64_t t0;
+    double t0;
     int n;
     double started_epoch, ended_epoch;
     char rec_hex[4096];
 
-    /* Gate on the disabled/reentrant state BEFORE any work: when the connector
-     * is off (g_producer == NULL, e.g. DARSHAN_MOFKA_ENABLE=0) the hooked op must
-     * pay nothing -- not even the now_ns() clock_gettime -- so the runtime-only
-     * baseline is truly zero-overhead and the overhead A/B measures only real
-     * streaming cost. (Matches the upstream LDMS connector's early-out.) */
+    /* Gate on the disabled/reentrant state BEFORE any work: when the connector is
+     * off (g_producer == NULL, e.g. DARSHAN_MOFKA_ENABLE=0) the hooked op pays
+     * nothing, so the runtime-only baseline is truly zero-overhead and the overhead
+     * A/B measures only real streaming cost. (Matches the upstream LDMS early-out.) */
     if (g_producer == NULL || g_in_send) return;
     g_in_send = 1;
-    t0 = now_ns();
+    t0 = darshan_core_wtime();
 
     if (!g_meta_sent) { g_meta_sent = 1; emit_metadata(); }
 
@@ -293,11 +286,11 @@ out:
 void darshan_mofka_connector_finalize(void)
 {
     int rc;
-    uint64_t t0;
+    double t0;
 
     if (g_producer == NULL) goto clear;
 
-    t0 = now_ns();
+    t0 = darshan_core_wtime();
     { const char* fe = getenv("DARSHAN_MOFKA_FLUSH_MS");
       unsigned flush_ms = (fe && *fe) ? (unsigned)strtoul(fe, NULL, 10) : 5000;
       rc = diaspora_producer_flush_timeout(g_producer, flush_ms); }
