@@ -107,7 +107,7 @@ static void read_self_meta(void)
      * exactly instead of carrying /proc, /sys, cgroup, tmpfs, etc. */
     static const char* const fs_excl[] = {
         "tmpfs", "proc", "sysfs", "devpts", "binfmt_misc", "fusectl",
-        "debugfs", "securityfs", "nfsd", "none", "ipc_pipefs", "hugetlbfs",
+        "debugfs", "securityfs", "nfsd", "none", "rpc_pipefs", "hugetlbfs",
         "cgroup", NULL };
     f = fopen("/proc/mounts", "r");
     if (f) {
