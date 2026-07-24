@@ -102,14 +102,25 @@ static void read_self_meta(void)
     }
     if (g_exe[0] == '\0') snprintf(g_exe, sizeof(g_exe), "unknown");
 
+    /* Same pseudo-filesystem filter native Darshan applies (darshan-core.c
+     * fs_exclusions[]), so the streamed mount table matches the native log
+     * exactly instead of carrying /proc, /sys, cgroup, tmpfs, etc. */
+    static const char* const fs_excl[] = {
+        "tmpfs", "proc", "sysfs", "devpts", "binfmt_misc", "fusectl",
+        "debugfs", "securityfs", "nfsd", "none", "ipc_pipefs", "hugetlbfs",
+        "cgroup", NULL };
     f = fopen("/proc/mounts", "r");
     if (f) {
         char line[600];
         size_t off = 0;
         while (fgets(line, sizeof(line), f)) {
             char dev[256], mp[256], fstype[64];
-            int w;
+            int w, k, excl = 0;
             if (sscanf(line, "%255s %255s %63s", dev, mp, fstype) != 3) continue;
+            if (mp[0] != '/') continue;   /* drop artifacts like the "0 0" line */
+            for (k = 0; fs_excl[k]; k++)
+                if (strcmp(fstype, fs_excl[k]) == 0) { excl = 1; break; }
+            if (excl) continue;
             w = snprintf(g_mounts + off, sizeof(g_mounts) - off,
                     "%s%s %s", off ? ";" : "", mp, fstype);
             if (w < 0 || (size_t)w >= sizeof(g_mounts) - off) break; /* full */
@@ -263,11 +274,14 @@ void darshan_mofka_connector_send(uint64_t record_id, int64_t rank,
     double started_epoch, ended_epoch;
     char rec_hex[4096];
 
-    if (g_in_send) return;
+    /* Gate on the disabled/reentrant state BEFORE any work: when the connector
+     * is off (g_producer == NULL, e.g. DARSHAN_MOFKA_ENABLE=0) the hooked op must
+     * pay nothing -- not even the now_ns() clock_gettime -- so the runtime-only
+     * baseline is truly zero-overhead and the overhead A/B measures only real
+     * streaming cost. (Matches the upstream LDMS connector's early-out.) */
+    if (g_producer == NULL || g_in_send) return;
     g_in_send = 1;
     t0 = now_ns();
-
-    if (g_producer == NULL) goto out;
 
     if (!g_meta_sent) { g_meta_sent = 1; emit_metadata(); }
 
@@ -334,16 +348,18 @@ void darshan_mofka_connector_finalize(void)
       unsigned flush_ms = (fe && *fe) ? (unsigned)strtoul(fe, NULL, 10) : 5000;
       rc = diaspora_producer_flush_timeout(g_producer, flush_ms); }
     if (rc == DIASPORA_C_TIMEOUT)
-        darshan_core_fprintf(stderr, "darshan-mofka: flush timed out; leaking handles.\n");
+        darshan_core_fprintf(stderr, "darshan-mofka: flush timed out; some events may be dropped.\n");
     else if (rc == DIASPORA_C_ERR)
         darshan_core_fprintf(stderr, "darshan-mofka: flush error (%s)\n",
                 diaspora_c_last_error());
     mofka_took("finalize", t0);
 
 clear:
-    g_producer = NULL;
-    g_topic = NULL;
-    g_driver = NULL;
+    /* Tear down on every path (including flush timeout) rather than leaking --
+     * order matches the diaspora_c.h example: producer, then topic, then driver. */
+    if (g_producer) { diaspora_producer_destroy(g_producer); g_producer = NULL; }
+    if (g_topic)    { diaspora_topic_destroy(g_topic);       g_topic = NULL; }
+    if (g_driver)   { diaspora_driver_destroy(g_driver);     g_driver = NULL; }
 }
 
 #else
