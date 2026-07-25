@@ -29,6 +29,13 @@ void darshan_mofka_connector_send(uint64_t record_id, int64_t rank,
 
 void darshan_mofka_connector_finalize(void);
 
+/* Stream the FINAL state of every in-memory module record (opt-in via DARSHAN_MOFKA_FINAL_SWEEP=1).
+ * Call at finalize BEFORE module buffers are freed. reconstruct max-seq dedup makes re-sending
+ * already-streamed records harmless; this recovers records whose ops were never streamed live.
+ * DISABLED BY DEFAULT: enabling it hangs python-ml at shutdown (mofka progress-pool send stall);
+ * see the KNOWN ISSUE note on the definition in darshan-mofka.c. */
+void darshan_mofka_connector_flush_records(struct darshan_core_runtime *core);
+
 #ifdef __cplusplus
 }
 #endif

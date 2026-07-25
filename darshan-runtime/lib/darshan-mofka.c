@@ -292,6 +292,61 @@ out:
     g_in_send = 0;
 }
 
+/* Opt-in (DARSHAN_MOFKA_FINAL_SWEEP=1): re-stream every in-memory module record's FINAL struct at
+ * shutdown, so records whose ops were never streamed live still land. Import-heavy workloads (e.g.
+ * python-ml) open interpreter-startup files during the ~200ms producer-init window; those files'
+ * per-op sends are no-ops (producer not up yet) even though Darshan records them in memory, so they
+ * are absent from the live stream but present in the native log. This sweep recovers them.
+ * Re-sending records that WERE streamed live is harmless -- reconstruct keeps the max-seq snapshot
+ * per (module,record,rank). Variable-size/heatmap/unknown modules are dropped on the reconstruct
+ * side by its record-size check, and op="FINAL" contributes no heatmap bins, so this only makes
+ * COUNTERS complete (the per-op heatmap for init-window files stays approximate -- known caveat).
+ * Must run BEFORE mod_cleanup_func() frees the record buffers (see darshan-core.c cleanup:).
+ *
+ * KNOWN ISSUE -- DISABLED BY DEFAULT. When enabled, the FIRST push here hangs indefinitely on
+ * python-ml: the extra records are NEW async sends issued from the atexit/shutdown context, and
+ * mofka's producer sender loop runs on the margo *progress* pool (MofkaDriver::defaultThreadPool ->
+ * get_progress_pool), so a send RPC initiated once the process is winding down never progresses.
+ * Live sends work because they run while the process is active. Confirmed 2026-07-25: clean HEAD
+ * (no sweep) completes python-ml with the known counter gap; every run with the sweep on hangs at
+ * finalize (no `finalize` timing line, killed at walltime). A proper fix needs a mofka-side change
+ * (run the producer sender on a dedicated non-progress pool), out of scope here. C is unaffected
+ * (byte-exact) and never enables this. Left in place, off, for a future mofka fix. */
+void darshan_mofka_connector_flush_records(struct darshan_core_runtime* core)
+{
+    int m;
+
+    if (g_producer == NULL || core == NULL) return;
+    /* Off unless explicitly enabled: unset, "", and "0" all mean OFF (a plain NULL check would
+     * treat "0" as on). See the KNOWN ISSUE note above -- enabling this hangs python-ml. */
+    { const char* sw = getenv("DARSHAN_MOFKA_FINAL_SWEEP");
+      if (sw == NULL || sw[0] == '\0' || sw[0] == '0') return; }
+
+    for (m = 0; m < DARSHAN_KNOWN_MODULE_COUNT; m++)
+    {
+        struct darshan_core_module* mod = core->mod_array[m];
+        char  *p, *end;
+        size_t stride;
+
+        if (mod == NULL) continue;
+        stride = mod->rec_size;              /* fixed per-record stride captured at register */
+        if (stride == 0) continue;
+
+        p   = (char*) mod->rec_buf_start;
+        end = (char*) mod->rec_buf_p;        /* next free byte: records live in [start, p) */
+        for (; p && p + stride <= end; p += stride)
+        {
+            struct darshan_base_record* b = (struct darshan_base_record*) p;
+            darshan_mofka_connector_send(
+                b->id, b->rank, 0, "FINAL",
+                0, 0, 0, 0, 0,
+                0.0, 0.0, 0.0,
+                (char*) darshan_module_names[m], "final_record",
+                p, (uint64_t) stride);
+        }
+    }
+}
+
 void darshan_mofka_connector_finalize(void)
 {
     int rc;

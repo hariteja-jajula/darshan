@@ -766,6 +766,12 @@ void darshan_core_shutdown(int write_log)
     }
 
 cleanup:
+#ifdef HAVE_MOFKA
+    /* stream every module record's FINAL state BEFORE the buffers are freed below, so records
+     * whose ops were never streamed live (e.g. python interpreter-startup files opened during the
+     * producer-init window) still land. No-op unless DARSHAN_MOFKA_FINAL_SWEEP is set. */
+    darshan_mofka_connector_flush_records(final_core);
+#endif
     for(i = 0; i < DARSHAN_KNOWN_MODULE_COUNT; i++)
         if(final_core->mod_array[i])
             final_core->mod_array[i]->mod_funcs.mod_cleanup_func();
@@ -2551,6 +2557,7 @@ int darshan_core_register_module(
 
     /* set module structure to register with Darshan core */
     mod->mod_funcs = mod_funcs;
+    mod->rec_size = rec_size;   /* remember the record stride for the finalize sweep */
     if((mod_id != DXT_POSIX_MOD) && (mod_id != DXT_MPIIO_MOD))
     {
         /* for traditional (non-DXT) modules, calculate how many module records
