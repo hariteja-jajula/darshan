@@ -37,6 +37,10 @@ static int64_t g_uid   = -1;
 static int64_t g_jobid = -1;
 static double  g_t0_epoch;
 static int     g_timing;   /* cached DARSHAN_MOFKA_TIMING: set once in initialize */
+static int64_t g_launcher_rank = -1;  /* real per-process rank from the MPI launcher (see initialize).
+                                       * The non-MPI Darshan lib reports rank 0 for every process, so
+                                       * without this every mpirun rank streams as rank 0 and the
+                                       * reconstruction collapses distinct ranks into one record. */
 
 static const char *g_exemnt = NULL;   /* core's exe+mounts buffer (init_core->log_exemnt_p) */
 static char        g_host_esc[300];   /* g_hostname JSON-escaped once at init (job constant) */
@@ -130,6 +134,15 @@ void darshan_mofka_connector_initialize(struct darshan_core_runtime* init_core)
 
     g_timing = (getenv("DARSHAN_MOFKA_TIMING") != NULL);
     g_pid = (long)(init_core ? init_core->pid : getpid());
+
+    /* Real per-process rank for multi-process runs. The non-MPI Darshan lib assigns rank 0 to every
+     * process, so under mpirun all ranks would stream as rank 0 and the reconstruction (keyed on
+     * module/record_id/rank) would collapse distinct ranks into one record. The MPI launcher exports
+     * the true rank in the environment -- read it once here and stamp it on every event (see send). */
+    { const char* r = getenv("OMPI_COMM_WORLD_RANK");   /* Open MPI */
+      if (!r) r = getenv("PMIX_RANK");                  /* PMIx / PRRTE */
+      if (!r) r = getenv("PMI_RANK");                   /* MPICH / Intel MPI */
+      if (r && *r) g_launcher_rank = (int64_t)strtoll(r, NULL, 10); }
 
     /* Honor the connector's own enable flag: DARSHAN_MOFKA_ENABLE=0 leaves
      * Darshan recording but sets up no producer, so nothing streams -- the
@@ -275,7 +288,7 @@ void darshan_mofka_connector_send(uint64_t record_id, int64_t rank,
         rwo ? rwo : "?",
         (unsigned long long)record_id, file_esc,
         g_host_esc, g_pid, (long long)g_uid, (long long)g_jobid,
-        (long long)rank, seq, g_t0_epoch,
+        (long long)(g_launcher_rank >= 0 ? g_launcher_rank : rank), seq, g_t0_epoch,
         (long long)record_count, (long long)offset, (long long)length,
         (long long)max_byte, (long long)rw_switch, (long long)flushes,
         started_epoch, ended_epoch, end_time - start_time, total_time,
