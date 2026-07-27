@@ -2,12 +2,18 @@
  * Copyright (C) 2026 University of Chicago.
  * See COPYRIGHT notice in top-level directory.
  *
- * darshan-mofka-reconstruct.c -- best-effort partial .darshan reconstruction
- * from Darshan->Mofka JSONL captures.
+ * darshan-mofka-reconstruct.c -- reconstruct per-process .darshan logs from
+ * Darshan->Mofka JSONL captures.
  *
  * Input is the JSONL produced by server/capture.py in the parent demo repo.
- * The tool keeps the latest rec_hex snapshot for each (module, record_id, rank)
- * and writes those module records into a partial Darshan log.
+ * The tool keeps the latest rec_hex snapshot for each (module, record_id, rank, pid),
+ * groups records by producing process (pid), and writes ONE native-style .darshan log
+ * per process into the output directory -- mirroring native Darshan's per-process log
+ * output for any workload (non-MPI C, python, MPI). pid is part of the key because
+ * non-MPI Darshan reports rank 0 for every process, so keying on rank alone would
+ * collapse all processes that touch the same filenames into one record.
+ *
+ * Usage: darshan-mofka-reconstruct <events.jsonl> <output_directory>
  */
 #ifdef HAVE_CONFIG_H
 # include "darshan-util-config.h"
@@ -19,9 +25,12 @@
 #include <inttypes.h>
 #include <limits.h>
 #include <math.h>
+#include <pwd.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <sys/types.h>
 #include <time.h>
 
 #include "uthash-1.9.2/src/uthash.h"
@@ -32,6 +41,12 @@ struct rec_key
     int mod_id;
     uint64_t record_id;
     int64_t rank;
+    int64_t pid;    /* per-producer identity: keeps distinct processes' final records
+                     * separate. Non-MPI Darshan stamps rank 0 on every process, so
+                     * (mod,record_id,rank) alone collapses N processes writing the same
+                     * filenames into one record; adding pid mirrors native's N per-process
+                     * logs (each a separate rank-0 record that pydarshan then sums). For
+                     * real MPI each rank has a distinct rank AND pid, so this is a no-op. */
 };
 
 struct stream_record
@@ -44,8 +59,13 @@ struct stream_record
     UT_hash_handle hlink;
 };
 
+/* Per-process job metadata. Native Darshan writes one log per process, each with
+ * that process's own uid/jobid/start_time/hostname/exe+mounts. The stream carries
+ * all processes interleaved, so we key job info by pid (uthash) and reconstruct one
+ * log per pid -- mirroring native's per-process output for every workload type. */
 struct job_info
 {
+    int64_t pid;          /* hash key: the producing process (-1 for the legacy/global entry) */
     int have_uid;
     int have_jobid;
     int64_t uid;
@@ -54,13 +74,134 @@ struct job_info
     double end_time;
     char hostname[256];
     char exemnt[4096];    /* core's exe+mounts buffer: "<exe>\n<type>\t<path>..." */
+    UT_hash_handle hlink;
 };
 
 static int hex_value(int c);   /* fwd decl: used by json_get_string's \u case */
 
 static void usage(const char *prog)
 {
-    fprintf(stderr, "Usage: %s <events.jsonl> <job_partial.darshan>\n", prog);
+    fprintf(stderr, "Usage: %s <events.jsonl> <output_directory>\n", prog);
+    fprintf(stderr,
+        "  Reconstructs one .darshan log per producing process (pid) found in the\n"
+        "  JSONL stream, mirroring native Darshan's per-process log output. Files are\n"
+        "  named like native logs and written into <output_directory> (created if absent).\n");
+}
+
+/* Look up (or create) the per-pid job_info entry in the hash. pid is the hash key. */
+static struct job_info *job_for_pid(struct job_info **jobs, int64_t pid)
+{
+    struct job_info *j;
+    HASH_FIND(hlink, *jobs, &pid, sizeof(int64_t), j);
+    if(j) return j;
+    j = calloc(1, sizeof(*j));
+    if(!j) return NULL;
+    j->pid = pid;
+    HASH_ADD(hlink, *jobs, pid, sizeof(int64_t), j);
+    return j;
+}
+
+static void free_jobs(struct job_info *jobs)
+{
+    struct job_info *j, *tmp;
+    HASH_ITER(hlink, jobs, j, tmp)
+    {
+        HASH_DELETE(hlink, jobs, j);
+        free(j);
+    }
+}
+
+/* FNV-1a 64-bit: a small self-contained deterministic hash for the log filename's
+ * "logmod" field. Native computes logmod as a Jenkins hash of the hostname seeded by
+ * the microsecond wall-clock time at log-open (shutdown) -- that seed is random and is
+ * NOT recorded in the stream, so native's exact value cannot be reproduced. We instead
+ * derive a stable, native-looking 64-bit number from data we DO have (hostname + the
+ * process's recorded start epoch in microseconds), so reconstructed names are unique
+ * per process and reproducible from the same stream. */
+static uint64_t fnv1a64(const void *data, size_t len, uint64_t seed)
+{
+    const unsigned char *p = (const unsigned char *)data;
+    uint64_t h = 1469598103934665603ULL ^ seed;
+    size_t i;
+    for(i = 0; i < len; i++)
+    {
+        h ^= p[i];
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+/* Basename of the exe command line stored in exemnt ("<exe> <args>\n<mounts...>").
+ * Native uses glibc __progname == basename(argv[0]); mirror that: take the first
+ * whitespace-delimited token, then its trailing path component. Writes into out. */
+static void exe_progname(const char *exemnt, char *out, size_t outsz)
+{
+    const char *end, *slash;
+    size_t n;
+
+    out[0] = '\0';
+    if(!exemnt || !*exemnt) { snprintf(out, outsz, "unknown"); return; }
+
+    /* first token: up to first space or newline */
+    end = exemnt;
+    while(*end && *end != ' ' && *end != '\t' && *end != '\n') end++;
+
+    /* basename within [exemnt, end) */
+    slash = end;
+    while(slash > exemnt && slash[-1] != '/') slash--;
+
+    n = (size_t)(end - slash);
+    if(n == 0 || n >= outsz) { snprintf(out, outsz, "unknown"); return; }
+    memcpy(out, slash, n);
+    out[n] = '\0';
+}
+
+/* Reconstruct native Darshan's per-process log filename as faithfully as the stream
+ * allows (darshan-core.c darshan_get_logfile_name):
+ *   <cuser>_<progname>_id<jobid>-<pid>_<mon>-<mday>-<secs_of_day>-<logmod>_1.darshan
+ * cuser: resolved from uid via getpwuid (native uses LOGNAME; uid->name matches on the
+ *        same system), falling back to the numeric uid. date fields: localtime of the
+ *        process start epoch (verified to match native exactly). logmod: see fnv1a64
+ *        (native's true value is unreproducible). trailing _N: native's near-universal 1. */
+static void build_native_logname(char *out, size_t outsz, const struct job_info *j)
+{
+    char cuser[256];
+    char progname[256];
+    struct tm *lt;
+    time_t st;
+    uint64_t logmod;
+    int secs_of_day;
+
+    /* cuser */
+    if(j->have_uid && j->uid >= 0)
+    {
+        struct passwd *pw = getpwuid((uid_t)j->uid);
+        if(pw && pw->pw_name && *pw->pw_name)
+            snprintf(cuser, sizeof(cuser), "%s", pw->pw_name);
+        else
+            snprintf(cuser, sizeof(cuser), "%u", (unsigned)j->uid);
+    }
+    else
+    {
+        snprintf(cuser, sizeof(cuser), "unknown");
+    }
+
+    exe_progname(j->exemnt, progname, sizeof(progname));
+
+    st = (time_t)(j->start_time > 0.0 ? j->start_time : time(NULL));
+    lt = localtime(&st);
+    if(!lt) { time_t now = time(NULL); lt = localtime(&now); }
+    secs_of_day = lt->tm_hour * 3600 + lt->tm_min * 60 + lt->tm_sec;
+
+    logmod = fnv1a64(j->hostname, strlen(j->hostname),
+        (uint64_t)(j->start_time * 1000000.0));
+
+    snprintf(out, outsz,
+        "%s_%s_id%lld-%lld_%d-%d-%d-%" PRIu64 "_1.darshan",
+        cuser, progname,
+        (long long)(j->have_jobid ? j->jobid : -1),
+        (long long)j->pid,
+        lt->tm_mon + 1, lt->tm_mday, secs_of_day, logmod);
 }
 
 static const char *json_find_key(const char *line, const char *key)
@@ -409,7 +550,8 @@ static int should_replace(struct stream_record *old, unsigned long long seq, dou
 }
 
 static void add_record(struct stream_record **records, int mod_id, uint64_t record_id,
-    int64_t rank, void *buf, size_t len, unsigned long long seq, double ended_at)
+    int64_t rank, int64_t pid, void *buf, size_t len, unsigned long long seq,
+    double ended_at)
 {
     struct rec_key key;
     struct stream_record *ent;
@@ -418,6 +560,7 @@ static void add_record(struct stream_record **records, int mod_id, uint64_t reco
     key.mod_id = mod_id;
     key.record_id = record_id;
     key.rank = rank;
+    key.pid = pid;
 
     HASH_FIND(hlink, *records, &key, sizeof(key), ent);
     if(!should_replace(ent, seq, ended_at))
@@ -517,6 +660,27 @@ static void free_records(struct stream_record *records)
     }
 }
 
+/* Build a fresh name_hash containing only the names referenced by target_pid's
+ * records, resolved against the global name hash. Native writes one namehash per
+ * per-process log holding just that process's files; this reproduces that so each
+ * reconstructed log is self-contained. Caller frees with free_namehash(). */
+static struct darshan_name_record_ref *build_pid_namehash(
+    struct stream_record *records, int64_t target_pid,
+    struct darshan_name_record_ref *global_names)
+{
+    struct darshan_name_record_ref *sub = NULL;
+    struct stream_record *rec, *tmp;
+
+    HASH_ITER(hlink, records, rec, tmp)
+    {
+        const char *name;
+        if(rec->key.pid != target_pid) continue;
+        name = lookup_record_name(global_names, rec->key.record_id);
+        if(name) add_name_record(&sub, rec->key.record_id, name);
+    }
+    return sub;
+}
+
 /* ---- HEATMAP reconstruction ---------------------------------------------
  * Darshan's runtime builds a per-rank HEATMAP record for each active module by
  * time-binning every read/write op (darshan-runtime/lib/darshan-heatmap.c).
@@ -531,6 +695,7 @@ static void free_records(struct stream_record *records)
 struct hm_op {
     int mod_id;
     int64_t rank;
+    int64_t pid;      /* producing process: heatmaps are rebuilt per pid, one per log */
     int is_write;
     int64_t bytes;
     double start_abs;
@@ -539,8 +704,8 @@ struct hm_op {
 static struct hm_op *g_hm_ops = NULL;
 static size_t g_hm_n = 0, g_hm_cap = 0;
 
-static void hm_capture(int mod_id, int64_t rank, int is_write, int64_t bytes,
-    double start_abs, double end_abs)
+static void hm_capture(int mod_id, int64_t rank, int64_t pid, int is_write,
+    int64_t bytes, double start_abs, double end_abs)
 {
     struct hm_op *o;
     if(bytes <= 0 || start_abs <= 0.0) return;
@@ -556,6 +721,7 @@ static void hm_capture(int mod_id, int64_t rank, int is_write, int64_t bytes,
     o = &g_hm_ops[g_hm_n++];
     o->mod_id = mod_id;
     o->rank = rank;
+    o->pid = pid;
     o->is_write = is_write;
     o->bytes = bytes;
     o->start_abs = start_abs;
@@ -564,7 +730,7 @@ static void hm_capture(int mod_id, int64_t rank, int is_write, int64_t bytes,
 
 static int read_events(const char *path, struct stream_record **records,
     struct darshan_name_record_ref **name_hash, int64_t *max_rank,
-    struct job_info *job, unsigned long long *event_count)
+    struct job_info **jobs, unsigned long long *event_count)
 {
     FILE *fp;
     char *line = NULL;
@@ -582,15 +748,22 @@ static int read_events(const char *path, struct stream_record **records,
     {
         char *module = NULL, *file = NULL, *hex = NULL;
         uint64_t record_id = 0;
-        int64_t rank = -1, rec_size_i = 0;
+        int64_t rank = -1, pid = -1, rec_size_i = 0;
         unsigned long long seq = 0;
         double ended_at = 0.0;
         int mod_id, exp_size;
         void *buf;
         size_t len;
+        struct job_info *job;
 
         (void)nread;
-        update_job_info(job, line);
+        /* Route job metadata to this line's pid so every process gets its own
+         * uid/jobid/start_time/hostname/exe+mounts (metadata events and module
+         * events both carry pid). This is what lets us write one native-style
+         * per-process log per pid, for any workload. */
+        { int64_t jp = -1; json_get_i64(line, "pid", &jp);
+          job = job_for_pid(jobs, jp);
+          if(job) update_job_info(job, line); }
 
         module = json_get_string(line, "module");
         mod_id = module_name_to_id(module);
@@ -598,6 +771,7 @@ static int read_events(const char *path, struct stream_record **records,
 
         if(!json_get_u64_hex_or_dec(line, "record_id", &record_id)) goto next;
         json_get_i64(line, "rank", &rank);
+        json_get_i64(line, "pid", &pid);
         json_get_i64(line, "rec_size", &rec_size_i);
         { uint64_t seq_u = 0; if(json_get_u64(line, "seq", &seq_u)) seq = (unsigned long long)seq_u; }
         json_get_double(line, "ended_at", &ended_at);
@@ -620,7 +794,7 @@ static int read_events(const char *path, struct stream_record **records,
                     json_get_i64(line, "len", &nbytes);
                     json_get_epoch(line, "started_at", &s);
                     json_get_epoch(line, "ended_at", &e);
-                    hm_capture(mod_id, rank, is_w, nbytes, s, e);
+                    hm_capture(mod_id, rank, pid, is_w, nbytes, s, e);
                 }
                 free(op);
             }
@@ -645,7 +819,7 @@ static int read_events(const char *path, struct stream_record **records,
         file = json_get_string(line, "file");
         if(file) add_name_record(name_hash, record_id, file);
         if(rank >= 0 && rank > *max_rank) *max_rank = rank;
-        add_record(records, mod_id, record_id, rank, buf, len, seq, ended_at);
+        add_record(records, mod_id, record_id, rank, pid, buf, len, seq, ended_at);
         (*event_count)++;
 
 next:
@@ -684,8 +858,13 @@ static void fill_job(struct darshan_job *out, const struct job_info *in,
         in->hostname[0] ? in->hostname : "unknown");
 }
 
+/* Write one .darshan log for a single process (target_pid). Only records whose
+ * key.pid == target_pid (plus this pid's heatmap records, keyed with the same pid)
+ * are emitted, so each output file is a faithful per-process log -- exactly the shape
+ * native Darshan writes (one nprocs=1 log per process) for every workload type.
+ * A per-pid name_hash (only the names this pid's records reference) is passed in. */
 static int write_log(const char *outfile, struct stream_record *records,
-    struct darshan_name_record_ref *name_hash, int64_t max_rank,
+    int64_t target_pid, struct darshan_name_record_ref *name_hash, int64_t max_rank,
     const struct job_info *job_info,
     unsigned *written_out, unsigned *pruned_out)
 {
@@ -695,10 +874,14 @@ static int write_log(const char *outfile, struct stream_record *records,
     struct darshan_mnt_info mnt;
     uint64_t partial = 0;
     int ret;
-    int64_t nprocs = max_rank + 1;
+    /* One process per output log, matching native's per-process nprocs=1 logs. */
+    int64_t nprocs = 1;
+
+    (void)max_rank;
 
     HASH_ITER(hlink, records, rec, tmp)
     {
+        if(rec->key.pid != target_pid) continue;
         if(record_is_empty(rec->key.mod_id, rec->buf,
             lookup_record_name(name_hash, rec->key.record_id))) continue;
         DARSHAN_MOD_FLAG_SET(partial, rec->key.mod_id);
@@ -782,6 +965,7 @@ static int write_log(const char *outfile, struct stream_record *records,
             HASH_ITER(hlink, records, rec, tmp)
             {
                 if(rec->key.mod_id != m) continue;
+                if(rec->key.pid != target_pid) continue;
                 /* prune unused std streams, matching native Darshan */
                 if(record_is_empty(rec->key.mod_id, rec->buf,
                     lookup_record_name(name_hash, rec->key.record_id)))
@@ -826,21 +1010,23 @@ static uint64_t heatmap_ident(int mod_id, const char **name_out)
     }
 }
 
-/* Build one HEATMAP record per (module, rank) seen in the op stream and add it
- * to the record + name hashes so write_log emits it like any other record. */
-static void build_heatmap_records(struct stream_record **records,
-    struct darshan_name_record_ref **name_hash, const struct job_info *job)
+/* Build HEATMAP records for a SINGLE process (target_pid) from its captured ops,
+ * one record per (module, rank) that pid touched, keyed with target_pid so write_log
+ * emits them into that pid's log. Each per-process log thus gets its own heatmap with
+ * a single consistent nbins -- which is what pydarshan requires to render (a merged
+ * multi-process log has mixed nbins and pydarshan rejects it; native has the same
+ * limitation on merged logs, so we mirror native by staying per-process).
+ * Does NOT free g_hm_ops (reused across pids); caller frees once at the end. */
+static void build_heatmap_records_for_pid(struct stream_record **records,
+    struct darshan_name_record_ref **name_hash, const struct job_info *job,
+    int64_t target_pid)
 {
     double t0 = job->start_time;
     size_t i, j;
     char *done;
 
     if(g_hm_n == 0 || t0 <= 0.0)
-    {
-        free(g_hm_ops);
-        g_hm_ops = NULL; g_hm_n = g_hm_cap = 0;
         return;
-    }
     done = calloc(g_hm_n, 1);
     if(!done) return;
 
@@ -858,6 +1044,7 @@ static void build_heatmap_records(struct stream_record **records,
         uint64_t id;
 
         if(done[i]) continue;
+        if(g_hm_ops[i].pid != target_pid) { continue; }  /* leave other pids' ops for their pass */
         id = heatmap_ident(mod_id, &hmname);
         if(!hmname) { done[i] = 1; continue; }  /* module has no heatmap */
 
@@ -865,6 +1052,7 @@ static void build_heatmap_records(struct stream_record **records,
         for(j = i; j < g_hm_n; j++)
         {
             double e;
+            if(g_hm_ops[j].pid != target_pid) continue;
             if(g_hm_ops[j].mod_id != mod_id || g_hm_ops[j].rank != rank) continue;
             e = g_hm_ops[j].end_abs - t0;
             if(e > max_end) max_end = e;
@@ -893,6 +1081,7 @@ static void build_heatmap_records(struct stream_record **records,
             double s, e, dur;
             int64_t *bins;
             int b0, b1;
+            if(g_hm_ops[j].pid != target_pid) continue;
             if(g_hm_ops[j].mod_id != mod_id || g_hm_ops[j].rank != rank) continue;
             done[j] = 1;
             s = g_hm_ops[j].start_abs - t0; if(s < 0.0) s = 0.0;
@@ -931,22 +1120,36 @@ static void build_heatmap_records(struct stream_record **records,
         hr->base_rec.rank = rank;
 
         add_name_record(name_hash, id, hmname);
-        /* add_record takes ownership of hbuf */
-        add_record(records, DARSHAN_HEATMAP_MOD, id, rank, hbuf, bufsz, 1, 0.0);
+        /* add_record takes ownership of hbuf; keyed with target_pid so it lands in
+         * this process's log alongside its module records. */
+        add_record(records, DARSHAN_HEATMAP_MOD, id, rank, target_pid, hbuf, bufsz, 1, 0.0);
     }
 
     free(done);
-    free(g_hm_ops);
-    g_hm_ops = NULL; g_hm_n = g_hm_cap = 0;
+}
+
+/* Ensure the output directory exists (like `mkdir -p` for a single level; the
+ * demo always passes an existing parent). Returns 0 on success. */
+static int ensure_dir(const char *path)
+{
+    struct stat st;
+    if(stat(path, &st) == 0)
+        return S_ISDIR(st.st_mode) ? 0 : -1;
+    if(mkdir(path, 0755) == 0)
+        return 0;
+    return -1;
 }
 
 int main(int argc, char **argv)
 {
     struct stream_record *records = NULL;
-    struct darshan_name_record_ref *name_hash = NULL;
+    struct darshan_name_record_ref *name_hash = NULL;   /* global id->name */
+    struct job_info *jobs = NULL;                        /* per-pid metadata hash */
+    struct job_info *job, *jtmp;
     int64_t max_rank = -1;
-    struct job_info job;
     unsigned long long event_count = 0;
+    const char *outdir;
+    unsigned files_ok = 0, files_fail = 0, npids = 0;
     int ret;
 
     if(argc != 3)
@@ -954,37 +1157,70 @@ int main(int argc, char **argv)
         usage(argv[0]);
         return 1;
     }
+    outdir = argv[2];
 
-    memset(&job, 0, sizeof(job));
-
-    ret = read_events(argv[1], &records, &name_hash, &max_rank, &job, &event_count);
+    ret = read_events(argv[1], &records, &name_hash, &max_rank, &jobs, &event_count);
     if(ret < 0)
         return 1;
-
-    /* rebuild per-module HEATMAP records from the captured op stream */
-    build_heatmap_records(&records, &name_hash, &job);
 
     if(HASH_CNT(hlink, records) == 0)
     {
         fprintf(stderr, "Error: no reconstructable module records found in %s\n", argv[1]);
         free_records(records);
         free_namehash(name_hash);
+        free_jobs(jobs);
         return 1;
     }
 
+    if(ensure_dir(outdir) != 0)
     {
-        unsigned written = 0, pruned = 0;
-        ret = write_log(argv[2], records, name_hash, max_rank, &job,
-            &written, &pruned);
-        if(ret == 0)
-        {
-            fprintf(stderr,
-                "reconstructed %u module records (%u pruned as empty) from %llu streamed events into %s\n",
-                written, pruned, event_count, argv[2]);
-        }
+        fprintf(stderr, "Error: cannot create/use output directory %s: %s\n",
+            outdir, strerror(errno));
+        free_records(records);
+        free_namehash(name_hash);
+        free_jobs(jobs);
+        return 1;
     }
+
+    /* One native-style .darshan log per producing process, mirroring native's
+     * per-process output. Skip the synthetic pid=-1 bucket (metadata-only lines
+     * with no pid); real producers all carry a pid. */
+    HASH_ITER(hlink, jobs, job, jtmp)
+    {
+        char logname[512];
+        char outpath[4096];
+        struct darshan_name_record_ref *pid_names;
+        unsigned written = 0, pruned = 0;
+        int64_t pid = job->pid;
+
+        if(pid < 0) continue;   /* no-pid metadata bucket */
+        npids++;
+
+        /* build this pid's heatmap records (keyed with pid) then its name subhash
+         * (must run after heatmaps so heatmap name records are included) */
+        build_heatmap_records_for_pid(&records, &name_hash, job, pid);
+        pid_names = build_pid_namehash(records, pid, name_hash);
+
+        build_native_logname(logname, sizeof(logname), job);
+        snprintf(outpath, sizeof(outpath), "%s/%s", outdir, logname);
+
+        ret = write_log(outpath, records, pid, pid_names, max_rank, job,
+            &written, &pruned);
+        if(ret == 0) files_ok++;
+        else         files_fail++;
+
+        free_namehash(pid_names);
+    }
+
+    fprintf(stderr,
+        "reconstructed %u per-process .darshan logs (%u pids, %u failed) "
+        "from %llu streamed events into %s/\n",
+        files_ok, npids, files_fail, event_count, outdir);
 
     free_records(records);
     free_namehash(name_hash);
-    return ret == 0 ? 0 : 1;
+    free_jobs(jobs);
+    free(g_hm_ops);
+    g_hm_ops = NULL; g_hm_n = g_hm_cap = 0;
+    return files_fail == 0 ? 0 : 1;
 }
