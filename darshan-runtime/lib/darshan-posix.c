@@ -262,6 +262,13 @@ static int darshan_mem_alignment = 1;
 #define POSIX_RECORD_REFOPEN(__ret, __rec_ref, __tm1, __tm2, __ref_counter) do { \
     if(__ret < 0 || !__rec_ref) break; \
     _POSIX_RECORD_OPEN(__ret, __rec_ref, 0, __tm1, __tm2, 0, __ref_counter); \
+    /* Stream the updated snapshot for fileno()/dup*()/fcntl(F_DUPFD) too. These paths bump \
+     * POSIX_OPENS and POSIX_FILENOS/POSIX_DUPS in place but historically sent no Mofka event, \
+     * so the reconstructor (max-seq last-writer-wins) kept the stale pre-refopen snapshot -> \
+     * undercounted OPENS/FILENOS/DUPS whenever a fileno/dup happened after the last streamed op \
+     * (e.g. Python's fopen->fileno after close). Mirror the open-path send at _POSIX_RECORD_MOFKA \
+     * so the later snapshot supersedes. No-op unless HAVE_MOFKA + runtime-enabled. (BX 2026-07-27) */ \
+    DARSHAN_MOFKA_SEND(__rec_ref->file_rec->base_rec.id, __rec_ref->file_rec->base_rec.rank, __rec_ref->file_rec->counters[POSIX_OPENS], "refopen", -1, -1, -1, -1, -1, __tm1, __tm2, __rec_ref->file_rec->fcounters[POSIX_F_META_TIME], "POSIX", "MET", (const void*)__rec_ref->file_rec, sizeof(*__rec_ref->file_rec)); \
 } while(0)
 
 #define _POSIX_RECORD_OPEN(__ret, __rec_ref, __mode, __tm1, __tm2, __reset_flag, __ref_counter) do { \
