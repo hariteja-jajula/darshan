@@ -256,7 +256,7 @@ static int darshan_mem_alignment = 1;
     if(dC.ldms_lib)\
         if(dC.posix_enable_ldms)\
             darshan_ldms_connector_send(__rec_ref->file_rec->base_rec.id, __rec_ref->file_rec->base_rec.rank, __rec_ref->file_rec->counters[POSIX_OPENS], "open", -1, -1, -1, -1, -1, __tm1, __tm2, __rec_ref->file_rec->fcounters[POSIX_F_META_TIME], "POSIX", "MET");\
-    DARSHAN_MOFKA_SEND(__rec_ref->file_rec->base_rec.id, __rec_ref->file_rec->base_rec.rank, __rec_ref->file_rec->counters[POSIX_OPENS], "open", -1, -1, -1, -1, -1, __tm1, __tm2, __rec_ref->file_rec->fcounters[POSIX_F_META_TIME], "POSIX", "MET", (const void*)__rec_ref->file_rec, sizeof(*__rec_ref->file_rec));\
+    darshan_mofka_connector_send(__rec_ref->file_rec->base_rec.id, __rec_ref->file_rec->base_rec.rank, __rec_ref->file_rec->counters[POSIX_OPENS], "open", -1, -1, -1, -1, -1, __tm1, __tm2, __rec_ref->file_rec->fcounters[POSIX_F_META_TIME], "POSIX", "MET", (const void*)__rec_ref->file_rec, sizeof(*__rec_ref->file_rec));\
 } while(0)
 
 #define POSIX_RECORD_REFOPEN(__ret, __rec_ref, __tm1, __tm2, __ref_counter) do { \
@@ -268,7 +268,7 @@ static int darshan_mem_alignment = 1;
      * undercounted OPENS/FILENOS/DUPS whenever a fileno/dup happened after the last streamed op \
      * (e.g. Python's fopen->fileno after close). Mirror the open-path send at _POSIX_RECORD_MOFKA \
      * so the later snapshot supersedes. No-op unless HAVE_MOFKA + runtime-enabled. (BX 2026-07-27) */ \
-    DARSHAN_MOFKA_SEND(__rec_ref->file_rec->base_rec.id, __rec_ref->file_rec->base_rec.rank, __rec_ref->file_rec->counters[POSIX_OPENS], "refopen", -1, -1, -1, -1, -1, __tm1, __tm2, __rec_ref->file_rec->fcounters[POSIX_F_META_TIME], "POSIX", "MET", (const void*)__rec_ref->file_rec, sizeof(*__rec_ref->file_rec)); \
+    darshan_mofka_connector_send(__rec_ref->file_rec->base_rec.id, __rec_ref->file_rec->base_rec.rank, __rec_ref->file_rec->counters[POSIX_OPENS], "refopen", -1, -1, -1, -1, -1, __tm1, __tm2, __rec_ref->file_rec->fcounters[POSIX_F_META_TIME], "POSIX", "MET", (const void*)__rec_ref->file_rec, sizeof(*__rec_ref->file_rec)); \
 } while(0)
 
 #define _POSIX_RECORD_OPEN(__ret, __rec_ref, __mode, __tm1, __tm2, __reset_flag, __ref_counter) do { \
@@ -356,7 +356,7 @@ static int darshan_mem_alignment = 1;
     if(dC.ldms_lib)\
         if(dC.posix_enable_ldms)\
             darshan_ldms_connector_send(rec_ref->file_rec->base_rec.id, rec_ref->file_rec->base_rec.rank, rec_ref->file_rec->counters[POSIX_READS], "read", this_offset, __ret, rec_ref->file_rec->counters[POSIX_MAX_BYTE_READ],rec_ref->file_rec->counters[POSIX_RW_SWITCHES], -1,  __tm1, __tm2, rec_ref->file_rec->fcounters[POSIX_F_READ_TIME], "POSIX", "MOD");\
-    DARSHAN_MOFKA_SEND(rec_ref->file_rec->base_rec.id, rec_ref->file_rec->base_rec.rank, rec_ref->file_rec->counters[POSIX_READS], "read", this_offset, __ret, rec_ref->file_rec->counters[POSIX_MAX_BYTE_READ], rec_ref->file_rec->counters[POSIX_RW_SWITCHES], -1, __tm1, __tm2, rec_ref->file_rec->fcounters[POSIX_F_READ_TIME], "POSIX", "MOD", (const void*)rec_ref->file_rec, sizeof(*rec_ref->file_rec));\
+    darshan_mofka_connector_send(rec_ref->file_rec->base_rec.id, rec_ref->file_rec->base_rec.rank, rec_ref->file_rec->counters[POSIX_READS], "read", this_offset, __ret, rec_ref->file_rec->counters[POSIX_MAX_BYTE_READ], rec_ref->file_rec->counters[POSIX_RW_SWITCHES], -1, __tm1, __tm2, rec_ref->file_rec->fcounters[POSIX_F_READ_TIME], "POSIX", "MOD", (const void*)rec_ref->file_rec, sizeof(*rec_ref->file_rec));\
 } while(0)
 
 #define POSIX_RECORD_WRITE(__ret, __fd, __pwrite_flag, __pwrite_offset, __aligned, __tm1, __tm2) do { \
@@ -426,7 +426,7 @@ static int darshan_mem_alignment = 1;
     if(dC.ldms_lib)\
         if(dC.posix_enable_ldms)\
             darshan_ldms_connector_send(rec_ref->file_rec->base_rec.id, rec_ref->file_rec->base_rec.rank, rec_ref->file_rec->counters[POSIX_WRITES], "write", this_offset, __ret, rec_ref->file_rec->counters[POSIX_MAX_BYTE_WRITTEN], rec_ref->file_rec->counters[POSIX_RW_SWITCHES], -1, __tm1, __tm2, rec_ref->file_rec->fcounters[POSIX_F_WRITE_TIME], "POSIX", "MOD");\
-    DARSHAN_MOFKA_SEND(rec_ref->file_rec->base_rec.id, rec_ref->file_rec->base_rec.rank, rec_ref->file_rec->counters[POSIX_WRITES], "write", this_offset, __ret, rec_ref->file_rec->counters[POSIX_MAX_BYTE_WRITTEN], rec_ref->file_rec->counters[POSIX_RW_SWITCHES], -1, __tm1, __tm2, rec_ref->file_rec->fcounters[POSIX_F_WRITE_TIME], "POSIX", "MOD", (const void*)rec_ref->file_rec, sizeof(*rec_ref->file_rec));\
+    darshan_mofka_connector_send(rec_ref->file_rec->base_rec.id, rec_ref->file_rec->base_rec.rank, rec_ref->file_rec->counters[POSIX_WRITES], "write", this_offset, __ret, rec_ref->file_rec->counters[POSIX_MAX_BYTE_WRITTEN], rec_ref->file_rec->counters[POSIX_RW_SWITCHES], -1, __tm1, __tm2, rec_ref->file_rec->fcounters[POSIX_F_WRITE_TIME], "POSIX", "MOD", (const void*)rec_ref->file_rec, sizeof(*rec_ref->file_rec));\
 } while(0)
 
 #define POSIX_LOOKUP_RECORD_STAT(__path, __statbuf, __tm1, __tm2) do { \
@@ -1771,7 +1771,7 @@ int DARSHAN_DECL(close)(int fd)
             if(dC.posix_enable_ldms)
                 darshan_ldms_connector_send(rec_ref->file_rec->base_rec.id, rec_ref->file_rec->base_rec.rank, rec_ref->close_counts, "close", -1, -1, -1, -1, -1, tm1, tm2, rec_ref->file_rec->fcounters[POSIX_F_META_TIME], "POSIX", "MOD");
 #endif
-        DARSHAN_MOFKA_SEND(rec_ref->file_rec->base_rec.id, rec_ref->file_rec->base_rec.rank, rec_ref->file_rec->counters[POSIX_OPENS], "close", -1, -1, -1, -1, -1, tm1, tm2, rec_ref->file_rec->fcounters[POSIX_F_META_TIME], "POSIX", "MOD", (const void*)rec_ref->file_rec, sizeof(*rec_ref->file_rec));
+        darshan_mofka_connector_send(rec_ref->file_rec->base_rec.id, rec_ref->file_rec->base_rec.rank, rec_ref->file_rec->counters[POSIX_OPENS], "close", -1, -1, -1, -1, -1, tm1, tm2, rec_ref->file_rec->fcounters[POSIX_F_META_TIME], "POSIX", "MOD", (const void*)rec_ref->file_rec, sizeof(*rec_ref->file_rec));
     }
     POSIX_POST_RECORD();
 

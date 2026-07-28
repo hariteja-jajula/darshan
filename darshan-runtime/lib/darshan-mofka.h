@@ -40,10 +40,8 @@ void darshan_mofka_connector_flush_records(struct darshan_core_runtime *core);
 }
 #endif
 
-#ifdef HAVE_MOFKA
-#define DARSHAN_MOFKA_SEND(...) darshan_mofka_connector_send(__VA_ARGS__)
-#else
-#define DARSHAN_MOFKA_SEND(...) do {} while(0)
-#endif
+/* One API, LDMS-style: modules call darshan_mofka_connector_send() directly
+ * (no DARSHAN_MOFKA_SEND macro). The !HAVE_MOFKA compile-out lives in a stubbed
+ * function body in darshan-mofka.c, exactly like darshan_ldms_connector_send(). */
 
 #endif /* __DARSHAN_MOFKA_H */

@@ -32,23 +32,15 @@ static diaspora_producer_t* g_producer;
 static atomic_ullong g_seq;
 static __thread int  g_in_send;
 
-/* ---- async off-the-hot-path streaming --------------------------------------
- * The Mofka push itself is fire-and-forget (diaspora_c.h:95: no broker round-trip
- * on the happy path), but the ~30-42us/op cost is CPU serialization -- hex_into of
- * the whole record + the big snprintf + the JSON re-parse inside push -- all paid
- * inline on the application thread. To get the app thread to ~sub-us we move ALL of
- * that to one (or more) background drain threads: the hot path only assigns seq,
- * snapshots the record bytes, and enqueues into a bounded ring; the drain thread(s)
- * serialize + push. "UDP semantics": when the ring is full we DROP (and count) by
- * default so the app never blocks; DARSHAN_MOFKA_DROP_POLICY=block makes it lossless
- * with backpressure instead. At finalize we stop the drain thread(s), let the ring
- * drain, then diaspora_producer_flush_timeout() -- i.e. "the last push is a flush".
- *
- * seq is assigned on the APP thread at enqueue (op-issue order) -- the reconstructor
- * keeps the max-seq snapshot per (module,record,rank,pid) (should_replace in
- * darshan-mofka-reconstruct.c), so seq MUST reflect issue order, not drain order.
- * The record struct is COPIED at enqueue because the live file_rec keeps mutating.
- * The largest streamed fixed record is H5D (912 B); MOFKA_REC_MAX bounds the copy. */
+/* Async off-the-hot-path streaming. The per-op cost is CPU serialization (hex_into +
+ * snprintf + push's JSON re-parse), not the network (push is fire-and-forget). The hot
+ * path only assigns seq, snapshots the record, and enqueues into a bounded ring; drain
+ * thread(s) serialize + push. Ring full: DROP+count by default, or block (backpressure)
+ * with DARSHAN_MOFKA_DROP_POLICY=block. Finalize joins the drain thread(s) then flushes.
+ * seq is assigned on the APP thread in op-issue order: the reconstructor keeps the
+ * max-seq snapshot per (module,record,rank,pid), so seq must reflect issue, not drain,
+ * order. The record is copied at enqueue (the live file_rec keeps mutating); the largest
+ * streamed fixed record is H5D (912 B) and MOFKA_REC_MAX bounds the copy. */
 #define MOFKA_REC_MAX   1024
 #define MOFKA_MAX_DRAIN 16
 
@@ -60,8 +52,7 @@ struct mofka_slot {
     const char *rwo;        /* string literals at every call site -> pointer is stable */
     const char *mod_name;
     const char *data_type;
-    char     file_esc[1024];/* escaped on the app thread (record-name hash isn't safe */
-                            /* to walk from the drain thread while app threads register)*/
+    char     file_esc[1024];/* escaped on the app thread (name-hash walk isn't drain-safe) */
     uint32_t rec_size;
     unsigned char rec[MOFKA_REC_MAX];
 };
@@ -96,9 +87,8 @@ static char        g_host_esc[300];   /* g_hostname JSON-escaped once at init (j
 static atomic_int  g_meta_sent;       /* one-shot metadata guard (atomic: emitted once across threads) */
 
 #define MOFKA_JSON_BUF 8192
-/* Envelope fragments shared verbatim by emit_metadata() and darshan_mofka_send() -- macros
- * (compile-time concatenation, no hot-path helper) so type/schema_version/identity live in
- * one place. The differing parts (activity_id, task_id, module/op, rank/seq) stay inline. */
+/* Envelope fragments shared verbatim by emit_metadata() and the send path (compile-time
+ * concatenation), so identity/schema live in one place; the differing parts stay inline. */
 #define MOFKA_ENV_HEAD   "{\"type\":\"task\","
 #define MOFKA_ENV_SCHEMA "\"schema\":\"darshan_runtime\",\"schema_version\":2,"
 #define MOFKA_ENV_IDENT  "\"hostname\":\"%s\",\"pid\":%ld,\"uid\":%lld,\"job_id\":%lld,"
@@ -392,11 +382,7 @@ static void mofka_serialize_and_push(const struct mofka_slot* s)
                 diaspora_c_last_error());
 }
 
-/* Drain thread: pull snapshotted slots off the ring and serialize+push them. One or
- * more of these run for the process lifetime (DARSHAN_MOFKA_DRAIN_THREADS). All the
- * per-op CPU cost lives here, so the app threads only pay the cheap enqueue. */
-/* Emit the one-shot metadata event exactly once across all threads. atomic CAS so
- * concurrent drain threads (or app threads in sync mode) can't double-emit. */
+/* Emit the one-shot metadata event exactly once across all threads (atomic CAS). */
 static void mofka_emit_metadata_once(void)
 {
     int expected = 0;
@@ -404,14 +390,14 @@ static void mofka_emit_metadata_once(void)
         emit_metadata();
 }
 
+/* Drain thread (DARSHAN_MOFKA_DRAIN_THREADS of them): pull snapshotted slots off the
+ * ring and serialize+push. All per-op CPU cost lives here; app threads only enqueue. */
 static void* mofka_drain_main(void* arg)
 {
     struct mofka_slot local;
     (void)arg;
-    /* Mark this thread as "in send" for its whole life: if diaspora_producer_push ever
-     * performed Darshan-instrumented POSIX/STDIO I/O it would otherwise re-enter
-     * connector_send and enqueue a feedback loop. (The push is margo/libfabric network
-     * I/O, which Darshan doesn't wrap, so this is a latent guard, not an active path.) */
+    /* Guard against a serialize+push path re-entering connector_send (latent: the push
+     * is margo/libfabric I/O that Darshan doesn't wrap, but keep the reentrancy fence). */
     g_in_send = 1;
     mofka_emit_metadata_once();   /* first drain thread emits metadata, off the app thread */
     for (;;) {
@@ -510,25 +496,15 @@ out:
 }
 
 /* Opt-in (DARSHAN_MOFKA_FINAL_SWEEP=1): re-stream every in-memory module record's FINAL struct at
- * shutdown, so records whose ops were never streamed live still land. Import-heavy workloads (e.g.
- * python-ml) open interpreter-startup files during the ~200ms producer-init window; those files'
- * per-op sends are no-ops (producer not up yet) even though Darshan records them in memory, so they
- * are absent from the live stream but present in the native log. This sweep recovers them.
- * Re-sending records that WERE streamed live is harmless -- reconstruct keeps the max-seq snapshot
- * per (module,record,rank). Variable-size/heatmap/unknown modules are dropped on the reconstruct
- * side by its record-size check, and op="FINAL" contributes no heatmap bins, so this only makes
- * COUNTERS complete (the per-op heatmap for init-window files stays approximate -- known caveat).
- * Must run BEFORE mod_cleanup_func() frees the record buffers (see darshan-core.c cleanup:).
+ * shutdown, recovering records whose live ops were no-ops because they fired during the ~200ms
+ * producer-init window (e.g. python-ml interpreter-startup files). Re-sending live-streamed records
+ * is harmless (reconstruct keeps the max-seq snapshot); op="FINAL" adds no heatmap bins, so this only
+ * completes COUNTERS. Must run BEFORE mod_cleanup_func() frees the record buffers.
  *
- * KNOWN ISSUE -- DISABLED BY DEFAULT. When enabled, the FIRST push here hangs indefinitely on
- * python-ml: the extra records are NEW async sends issued from the atexit/shutdown context, and
- * mofka's producer sender loop runs on the margo *progress* pool (MofkaDriver::defaultThreadPool ->
- * get_progress_pool), so a send RPC initiated once the process is winding down never progresses.
- * Live sends work because they run while the process is active. Confirmed 2026-07-25: clean HEAD
- * (no sweep) completes python-ml with the known counter gap; every run with the sweep on hangs at
- * finalize (no `finalize` timing line, killed at walltime). A proper fix needs a mofka-side change
- * (run the producer sender on a dedicated non-progress pool), out of scope here. C is unaffected
- * (byte-exact) and never enables this. Left in place, off, for a future mofka fix. */
+ * KNOWN ISSUE -- DISABLED BY DEFAULT. Enabled, the first push here hangs on python-ml: these are NEW
+ * sends from the shutdown context, and mofka's producer sender runs on the margo *progress* pool, so
+ * a send RPC started as the process winds down never progresses (live sends work; the process is
+ * still active). A proper fix is mofka-side (dedicated non-progress pool), out of scope here. */
 void darshan_mofka_connector_flush_records(struct darshan_core_runtime* core)
 {
     int m;
@@ -632,9 +608,44 @@ clear:
 
 #else
 
-/* No stub definitions when Mofka is unavailable: darshan-core.c guards the
- * initialize/finalize calls with #ifdef HAVE_MOFKA and DARSHAN_MOFKA_SEND()
- * expands to a no-op (see darshan-mofka.h), so none of the connector entry
- * points are referenced in a !HAVE_MOFKA build. */
+/* One API, LDMS-style: with Mofka unavailable, every connector entry point is a
+ * stubbed no-op body (mirrors the #else stubs for darshan_ldms_connector_* in
+ * darshan-ldms.c). The module hooks call darshan_mofka_connector_send() directly
+ * -- no macro -- so these empty definitions let a !HAVE_MOFKA build link. The
+ * compiler elides the empty calls. darshan-core.c still #ifdef-guards init/finalize. */
+
+void darshan_mofka_connector_initialize(struct darshan_core_runtime *init_core)
+{
+    (void)init_core;
+    return;
+}
+
+void darshan_mofka_connector_send(uint64_t record_id, int64_t rank,
+                                  int64_t record_count, char *rwo,
+                                  int64_t offset, int64_t length,
+                                  int64_t max_byte, int64_t rw_switch,
+                                  int64_t flushes,
+                                  double start_time, double end_time,
+                                  double total_time,
+                                  char *mod_name, char *data_type,
+                                  const void *rec, uint64_t rec_size)
+{
+    (void)record_id; (void)rank; (void)record_count; (void)rwo;
+    (void)offset; (void)length; (void)max_byte; (void)rw_switch;
+    (void)flushes; (void)start_time; (void)end_time; (void)total_time;
+    (void)mod_name; (void)data_type; (void)rec; (void)rec_size;
+    return;
+}
+
+void darshan_mofka_connector_flush_records(struct darshan_core_runtime *core)
+{
+    (void)core;
+    return;
+}
+
+void darshan_mofka_connector_finalize(void)
+{
+    return;
+}
 
 #endif /* HAVE_MOFKA */
