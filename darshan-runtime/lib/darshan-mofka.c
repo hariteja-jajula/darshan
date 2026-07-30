@@ -32,43 +32,35 @@ static diaspora_producer_t* g_producer;
 static atomic_ullong g_seq;
 static __thread int  g_in_send;
 
-/* Async off-the-hot-path streaming. The per-op cost is CPU serialization (hex_into +
- * snprintf + push's JSON re-parse), not the network (push is fire-and-forget). The hot
- * path only assigns seq, snapshots the record, and enqueues into a bounded ring; drain
- * thread(s) serialize + push. Ring full: DROP+count by default, or block (backpressure)
- * with DARSHAN_MOFKA_DROP_POLICY=block. Finalize joins the drain thread(s) then flushes.
- * seq is assigned on the APP thread in op-issue order: the reconstructor keeps the
- * max-seq snapshot per (module,record,rank,pid), so seq must reflect issue, not drain,
- * order. The record is copied at enqueue (the live file_rec keeps mutating); the largest
- * streamed fixed record is H5D (912 B) and MOFKA_REC_MAX bounds the copy. */
 #define MOFKA_REC_MAX   1024
 #define MOFKA_MAX_DRAIN 16
 
+/* One I/O event, snapshotted on the app thread and drained off it. */
 struct mofka_slot {
     uint64_t record_id;
     int64_t  rank, record_count, offset, length, max_byte, rw_switch, flushes;
     double   start_time, end_time, total_time;
     unsigned long long seq;
-    const char *rwo;        /* string literals at every call site -> pointer is stable */
+    const char *rwo;
     const char *mod_name;
     const char *data_type;
-    char     file_esc[1024];/* escaped on the app thread (name-hash walk isn't drain-safe) */
+    char     file_esc[1024];
     uint32_t rec_size;
     unsigned char rec[MOFKA_REC_MAX];
 };
 
-static int             g_async;         /* DARSHAN_MOFKA_ASYNC (default 1)              */
-static int             g_block;         /* DARSHAN_MOFKA_DROP_POLICY=block -> 1         */
+static int             g_async;
+static int             g_block;
 static struct mofka_slot *g_ring;
-static size_t          g_qdepth;        /* ring capacity (slots)                       */
-static size_t          g_head, g_tail;  /* head=producer, tail=consumer; both under mtx*/
+static size_t          g_qdepth;
+static size_t          g_head, g_tail;
 static pthread_mutex_t g_qmtx     = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t  g_notempty = PTHREAD_COND_INITIALIZER;
 static pthread_cond_t  g_notfull  = PTHREAD_COND_INITIALIZER;
 static pthread_t       g_drain[MOFKA_MAX_DRAIN];
 static int             g_ndrain;
 static volatile int    g_stop;
-static int             g_leak_ring;     /* set on join-timeout: a live drain thread may read g_ring */
+static int             g_leak_ring;
 static atomic_ullong   g_dropped;
 
 static char    g_hostname[256];
@@ -76,23 +68,24 @@ static long    g_pid;
 static int64_t g_uid   = -1;
 static int64_t g_jobid = -1;
 static double  g_t0_epoch;
-static int     g_timing;   /* cached DARSHAN_MOFKA_TIMING: set once in initialize */
-static int64_t g_launcher_rank = -1;  /* real per-process rank from the MPI launcher (see initialize).
-                                       * The non-MPI Darshan lib reports rank 0 for every process, so
-                                       * without this every mpirun rank streams as rank 0 and the
-                                       * reconstruction collapses distinct ranks into one record. */
+static int     g_timing;
+static int64_t g_launcher_rank = -1;
 
-static const char *g_exemnt = NULL;   /* core's exe+mounts buffer (init_core->log_exemnt_p) */
-static char        g_host_esc[300];   /* g_hostname JSON-escaped once at init (job constant) */
-static atomic_int  g_meta_sent;       /* one-shot metadata guard (atomic: emitted once across threads) */
+static const char *g_exemnt = NULL;
+static char        g_host_esc[300];
+static atomic_int  g_meta_sent;
 
 #define MOFKA_JSON_BUF 8192
-/* Envelope fragments shared verbatim by emit_metadata() and the send path (compile-time
- * concatenation), so identity/schema live in one place; the differing parts stay inline. */
+
 #define MOFKA_ENV_HEAD   "{\"type\":\"task\","
 #define MOFKA_ENV_SCHEMA "\"schema\":\"darshan_runtime\",\"schema_version\":2,"
 #define MOFKA_ENV_IDENT  "\"hostname\":\"%s\",\"pid\":%ld,\"uid\":%lld,\"job_id\":%lld,"
 
+/* ------------------------------------------------------------------ *
+ *  Helpers                                                           *
+ * ------------------------------------------------------------------ */
+
+/* Emit a per-call timing line when DARSHAN_MOFKA_TIMING is set. */
 static void mofka_took(const char* fn, double t0)
 {
     if (g_timing)
@@ -100,6 +93,7 @@ static void mofka_took(const char* fn, double t0)
             fn, (darshan_core_wtime() - t0) * 1e6);
 }
 
+/* Copy src into dst, escaping JSON-unsafe bytes; always NUL-terminates. */
 static void json_escape_into(char* dst, size_t dstsz, const char* src)
 {
     size_t o = 0;
@@ -117,6 +111,7 @@ static void json_escape_into(char* dst, size_t dstsz, const char* src)
     dst[o] = '\0';
 }
 
+/* Hex-encode n bytes of src into dst; always NUL-terminates. */
 static void hex_into(char* dst, size_t dstsz, const void* src, uint64_t n)
 {
     static const char H[] = "0123456789abcdef";
@@ -129,10 +124,7 @@ static void hex_into(char* dst, size_t dstsz, const void* src, uint64_t n)
     dst[o] = '\0';
 }
 
-/* One-shot: stream exe + mounts as a standalone metadata event (no module /
- * record_id, so the reconstructor's update_job_info picks it up and read_events
- * otherwise skips it). Bulky mounts would overflow the shared record buffer, so
- * this gets its own message. */
+/* Push the one-shot job metadata event (exe + mounts, no module record). */
 static void emit_metadata(void)
 {
     char buf[9216];
@@ -155,21 +147,28 @@ static void emit_metadata(void)
         g_host_esc, g_pid, (long long)g_uid, (long long)g_jobid,
         g_t0_epoch, exemnt_esc);
 
-    if (n < 0 || (size_t)n >= sizeof(buf)) return;  /* too big: skip metadata */
+    if (n < 0 || (size_t)n >= sizeof(buf)) return;
 
     if (diaspora_producer_push(g_producer, buf, NULL, 0) != DIASPORA_C_OK)
         darshan_core_fprintf(stderr, "darshan-mofka: metadata push failed (%s)\n",
                 diaspora_c_last_error());
 }
 
-/* fork() hazards for the drain thread: a pthread is NOT replicated into the child,
- * so a forked child would inherit the ring + a possibly-locked mutex with no thread
- * to drain it. Lock across the fork (prepare), unlock in the parent, and in the child
- * disable async entirely + null the producer -- Darshan re-inits per process anyway
- * (one process == one launcher rank), so the child simply streams nothing until its
- * own initialize runs. Mofka/margo is not fork-safe regardless. */
-static void* mofka_drain_main(void* arg);   /* fwd: used in initialize, defined below */
+/* Emit metadata exactly once across all threads (atomic CAS guard). */
+static void mofka_emit_metadata_once(void)
+{
+    int expected = 0;
+    if (atomic_compare_exchange_strong(&g_meta_sent, &expected, 1))
+        emit_metadata();
+}
 
+/* ------------------------------------------------------------------ *
+ *  Ring buffer + drain thread (the hot path lives here)              *
+ * ------------------------------------------------------------------ */
+
+/* fork() doesn't clone the drain thread: lock the ring across the fork, and in
+ * the child disable async + null the producer so it streams nothing until its
+ * own initialize runs. (Mofka/margo is not fork-safe.) */
 static void mofka_atfork_prepare(void) { pthread_mutex_lock(&g_qmtx); }
 static void mofka_atfork_parent(void)  { pthread_mutex_unlock(&g_qmtx); }
 static void mofka_atfork_child(void)
@@ -181,158 +180,7 @@ static void mofka_atfork_child(void)
     g_head = g_tail = 0; g_producer = NULL; g_topic = NULL; g_driver = NULL;
 }
 
-void darshan_mofka_connector_initialize(struct darshan_core_runtime* init_core)
-{
-    const char* group_file;
-    const char* topic_name;
-    char opts[1200];
-    char gf_esc[1024];
-    char pname[64];
-    double t0 = darshan_core_wtime();
-
-    g_timing = (getenv("DARSHAN_MOFKA_TIMING") != NULL);
-    g_pid = (long)(init_core ? init_core->pid : getpid());
-
-    /* Real per-process rank for multi-process runs. The non-MPI Darshan lib assigns rank 0 to every
-     * process, so under mpirun all ranks would stream as rank 0 and the reconstruction (keyed on
-     * module/record_id/rank) would collapse distinct ranks into one record. The MPI launcher exports
-     * the true rank in the environment -- read it once here and stamp it on every event (see send). */
-    { const char* r = getenv("OMPI_COMM_WORLD_RANK");   /* Open MPI */
-      if (!r) r = getenv("PMIX_RANK");                  /* PMIx / PRRTE */
-      if (!r) r = getenv("PMI_RANK");                   /* MPICH / Intel MPI */
-      if (r && *r) g_launcher_rank = (int64_t)strtoll(r, NULL, 10); }
-
-    /* Honor the connector's own enable flag: DARSHAN_MOFKA_ENABLE=0 leaves
-     * Darshan recording but sets up no producer, so nothing streams -- the
-     * runtime-only baseline for the overhead study. (Absent keeps the historical
-     * "stream if a group file is set" behavior; only an explicit 0 disables.) */
-    {
-        const char* en = getenv("DARSHAN_MOFKA_ENABLE");
-        if (en && strcmp(en, "0") == 0) {
-            mofka_took("initialize", t0);
-            return;
-        }
-    }
-
-    if (gethostname(g_hostname, sizeof(g_hostname)) != 0)
-        snprintf(g_hostname, sizeof(g_hostname), "unknown");
-    g_hostname[sizeof(g_hostname) - 1] = '\0';
-
-    json_escape_into(g_host_esc, sizeof(g_host_esc), g_hostname);  /* once, not per send (C3) */
-
-    /* Prefer the job's real start time -- it matches the native log's start_time and avoids
-     * the RDTSCP counter darshan_core_wtime_absolute() can hand back as an epoch (C4). */
-    g_t0_epoch = darshan_core_wtime_absolute();
-    if (init_core && init_core->log_job_p) {
-        g_uid      = (int64_t)init_core->log_job_p->uid;
-        g_jobid    = (int64_t)init_core->log_job_p->jobid;
-        g_t0_epoch = (double)init_core->log_job_p->start_time_sec
-                   + (double)init_core->log_job_p->start_time_nsec / 1e9;
-    }
-    if (init_core)
-        g_exemnt = init_core->log_exemnt_p;
-
-    group_file = getenv("DARSHAN_MOFKA_GROUP_FILE");
-    topic_name = getenv("DARSHAN_MOFKA_TOPIC");
-    if (topic_name == NULL || *topic_name == '\0') topic_name = "darshan";
-
-    size_t batch_size = 0 /* adaptive */, max_batches = 0;
-    { const char* e;
-      if ((e = getenv("DARSHAN_MOFKA_BATCH"))       && *e) batch_size  = (size_t)strtoull(e, NULL, 10);
-      if ((e = getenv("DARSHAN_MOFKA_MAX_BATCHES"))  && *e) max_batches = (size_t)strtoull(e, NULL, 10); }
-
-    if (group_file == NULL || *group_file == '\0') {
-        darshan_core_fprintf(stderr, "darshan-mofka: DARSHAN_MOFKA_GROUP_FILE not set; "
-                "records will not be streamed.\n");
-        return;
-    }
-
-    json_escape_into(gf_esc, sizeof(gf_esc), group_file);
-    snprintf(opts, sizeof(opts), "{\"group_file\":\"%s\"}", gf_esc);
-
-    g_driver = diaspora_driver_create("mofka", opts);
-    if (g_driver == NULL) {
-        darshan_core_fprintf(stderr, "darshan-mofka: driver_create failed (%s)\n",
-                diaspora_c_last_error());
-        return;
-    }
-
-    g_topic = diaspora_topic_open(g_driver, topic_name);
-    if (g_topic == NULL) {
-        darshan_core_fprintf(stderr, "darshan-mofka: topic_open('%s') failed (%s)\n",
-                topic_name, diaspora_c_last_error());
-        diaspora_driver_destroy(g_driver); g_driver = NULL;
-        return;
-    }
-
-    snprintf(pname, sizeof(pname), "darshan-%ld", g_pid);
-    g_producer = diaspora_producer_create(g_topic, pname, batch_size, max_batches,
-                                          DIASPORA_C_ORDERING_LOOSE);
-    if (g_producer == NULL) {
-        darshan_core_fprintf(stderr, "darshan-mofka: producer_create failed (%s)\n",
-                diaspora_c_last_error());
-        diaspora_topic_destroy(g_topic);   g_topic = NULL;
-        diaspora_driver_destroy(g_driver); g_driver = NULL;
-        return;
-    }
-
-    if (getenv("DARSHAN_MOFKA_VERBOSE"))
-        darshan_core_fprintf(stderr, "darshan-mofka: producer connected to topic '%s' "
-                "(batch_size=%zu max_num_batches=%zu)\n",
-                topic_name, batch_size, max_batches);
-
-    /* Async off-the-hot-path streaming (default ON). Spin up the ring + drain
-     * thread(s) so per-op app cost is just snapshot+enqueue. DARSHAN_MOFKA_ASYNC=0
-     * keeps the old synchronous inline push (for A/B and as a fallback). */
-    g_async = 1;
-    { const char* a = getenv("DARSHAN_MOFKA_ASYNC");
-      if (a && a[0] == '0') g_async = 0; }
-    if (g_async) {
-        const char* e;
-        g_qdepth = 65536;
-        if ((e = getenv("DARSHAN_MOFKA_QUEUE_DEPTH")) && *e) {
-            size_t q = (size_t)strtoull(e, NULL, 10);
-            if (q >= 2) g_qdepth = q;
-        }
-        g_block = 0;
-        if ((e = getenv("DARSHAN_MOFKA_DROP_POLICY")) && strcmp(e, "block") == 0) g_block = 1;
-        g_ndrain = 1;
-        if ((e = getenv("DARSHAN_MOFKA_DRAIN_THREADS")) && *e) {
-            int nd = (int)strtol(e, NULL, 10);
-            if (nd >= 1 && nd <= MOFKA_MAX_DRAIN) g_ndrain = nd;
-        }
-        g_stop = 0; g_head = g_tail = 0;
-        g_ring = calloc(g_qdepth, sizeof(*g_ring));
-        if (g_ring == NULL) {
-            darshan_core_fprintf(stderr, "darshan-mofka: ring calloc(%zu) failed; "
-                    "falling back to synchronous push.\n", g_qdepth);
-            g_async = 0;
-        } else {
-            int started = 0, i;
-            for (i = 0; i < g_ndrain; i++)
-                if (pthread_create(&g_drain[i], NULL, mofka_drain_main, NULL) == 0) started++;
-            g_ndrain = started;
-            if (started == 0) {
-                darshan_core_fprintf(stderr, "darshan-mofka: no drain thread started; "
-                        "falling back to synchronous push.\n");
-                free(g_ring); g_ring = NULL; g_async = 0;
-            } else {
-                pthread_atfork(mofka_atfork_prepare, mofka_atfork_parent, mofka_atfork_child);
-                if (getenv("DARSHAN_MOFKA_VERBOSE"))
-                    darshan_core_fprintf(stderr, "darshan-mofka: async ON "
-                            "(qdepth=%zu drain_threads=%d drop_policy=%s)\n",
-                            g_qdepth, g_ndrain, g_block ? "block" : "drop");
-            }
-        }
-    }
-
-    mofka_took("initialize", t0);
-}
-
-/* Build the JSON envelope from a snapshotted slot and push it. This does ALL the
- * expensive work (hex_into + snprintf + the push's internal JSON re-parse). In async
- * mode it runs ONLY on the drain thread(s), off the application critical path; in the
- * synchronous fallback (DARSHAN_MOFKA_ASYNC=0) the app thread calls it directly. */
+/* Build the JSON envelope from a snapshot and push it (all the CPU cost). */
 static void mofka_serialize_and_push(const struct mofka_slot* s)
 {
     char buf[MOFKA_JSON_BUF];
@@ -382,40 +230,169 @@ static void mofka_serialize_and_push(const struct mofka_slot* s)
                 diaspora_c_last_error());
 }
 
-/* Emit the one-shot metadata event exactly once across all threads (atomic CAS). */
-static void mofka_emit_metadata_once(void)
-{
-    int expected = 0;
-    if (atomic_compare_exchange_strong(&g_meta_sent, &expected, 1))
-        emit_metadata();
-}
-
-/* Drain thread (DARSHAN_MOFKA_DRAIN_THREADS of them): pull snapshotted slots off the
- * ring and serialize+push. All per-op CPU cost lives here; app threads only enqueue. */
+/* Drain thread: pop snapshots off the ring and serialize+push them. */
 static void* mofka_drain_main(void* arg)
 {
     struct mofka_slot local;
     (void)arg;
-    /* Guard against a serialize+push path re-entering connector_send (latent: the push
-     * is margo/libfabric I/O that Darshan doesn't wrap, but keep the reentrancy fence). */
+
     g_in_send = 1;
-    mofka_emit_metadata_once();   /* first drain thread emits metadata, off the app thread */
+    mofka_emit_metadata_once();
     for (;;) {
         pthread_mutex_lock(&g_qmtx);
         while (g_head == g_tail && !g_stop)
             pthread_cond_wait(&g_notempty, &g_qmtx);
         if (g_head == g_tail && g_stop) { pthread_mutex_unlock(&g_qmtx); break; }
-        local = g_ring[g_tail];                     /* copy out under lock */
+        local = g_ring[g_tail];
         g_tail = (g_tail + 1) % g_qdepth;
-        pthread_cond_signal(&g_notfull);            /* wake a blocked producer (block mode) */
+        pthread_cond_signal(&g_notfull);
         pthread_mutex_unlock(&g_qmtx);
         mofka_serialize_and_push(&local);
     }
     return NULL;
 }
 
-/* Hot path: snapshot the op into a ring slot and return. In sync-fallback mode
- * (g_async==0) it serializes+pushes inline exactly as the original connector did. */
+/* ------------------------------------------------------------------ *
+ *  Lifecycle: initialize -> send -> flush_records -> finalize        *
+ * ------------------------------------------------------------------ */
+
+/* Connect the producer and, unless ASYNC=0, start the ring + drain thread(s). */
+void darshan_mofka_connector_initialize(struct darshan_core_runtime* init_core)
+{
+    const char* group_file;
+    const char* topic_name;
+    char opts[1200];
+    char gf_esc[1024];
+    char pname[64];
+    double t0 = darshan_core_wtime();
+
+    g_timing = (getenv("DARSHAN_MOFKA_TIMING") != NULL);
+    g_pid = (long)(init_core ? init_core->pid : getpid());
+
+    { const char* r = getenv("OMPI_COMM_WORLD_RANK");
+      if (!r) r = getenv("PMIX_RANK");
+      if (!r) r = getenv("PMI_RANK");
+      if (r && *r) g_launcher_rank = (int64_t)strtoll(r, NULL, 10); }
+
+    {
+        const char* en = getenv("DARSHAN_MOFKA_ENABLE");
+        if (en && strcmp(en, "0") == 0) {
+            mofka_took("initialize", t0);
+            return;
+        }
+    }
+
+    if (gethostname(g_hostname, sizeof(g_hostname)) != 0)
+        snprintf(g_hostname, sizeof(g_hostname), "unknown");
+    g_hostname[sizeof(g_hostname) - 1] = '\0';
+
+    json_escape_into(g_host_esc, sizeof(g_host_esc), g_hostname);
+
+    g_t0_epoch = darshan_core_wtime_absolute();
+    if (init_core && init_core->log_job_p) {
+        g_uid      = (int64_t)init_core->log_job_p->uid;
+        g_jobid    = (int64_t)init_core->log_job_p->jobid;
+        g_t0_epoch = (double)init_core->log_job_p->start_time_sec
+                   + (double)init_core->log_job_p->start_time_nsec / 1e9;
+    }
+    if (init_core)
+        g_exemnt = init_core->log_exemnt_p;
+
+    group_file = getenv("DARSHAN_MOFKA_GROUP_FILE");
+    topic_name = getenv("DARSHAN_MOFKA_TOPIC");
+    if (topic_name == NULL || *topic_name == '\0') topic_name = "darshan";
+
+    size_t batch_size = 0 , max_batches = 0;
+    { const char* e;
+      if ((e = getenv("DARSHAN_MOFKA_BATCH"))       && *e) batch_size  = (size_t)strtoull(e, NULL, 10);
+      if ((e = getenv("DARSHAN_MOFKA_MAX_BATCHES"))  && *e) max_batches = (size_t)strtoull(e, NULL, 10); }
+
+    if (group_file == NULL || *group_file == '\0') {
+        darshan_core_fprintf(stderr, "darshan-mofka: DARSHAN_MOFKA_GROUP_FILE not set; "
+                "records will not be streamed.\n");
+        return;
+    }
+
+    json_escape_into(gf_esc, sizeof(gf_esc), group_file);
+    snprintf(opts, sizeof(opts), "{\"group_file\":\"%s\"}", gf_esc);
+
+    g_driver = diaspora_driver_create("mofka", opts);
+    if (g_driver == NULL) {
+        darshan_core_fprintf(stderr, "darshan-mofka: driver_create failed (%s)\n",
+                diaspora_c_last_error());
+        return;
+    }
+
+    g_topic = diaspora_topic_open(g_driver, topic_name);
+    if (g_topic == NULL) {
+        darshan_core_fprintf(stderr, "darshan-mofka: topic_open('%s') failed (%s)\n",
+                topic_name, diaspora_c_last_error());
+        diaspora_driver_destroy(g_driver); g_driver = NULL;
+        return;
+    }
+
+    snprintf(pname, sizeof(pname), "darshan-%ld", g_pid);
+    g_producer = diaspora_producer_create(g_topic, pname, batch_size, max_batches,
+                                          DIASPORA_C_ORDERING_LOOSE);
+    if (g_producer == NULL) {
+        darshan_core_fprintf(stderr, "darshan-mofka: producer_create failed (%s)\n",
+                diaspora_c_last_error());
+        diaspora_topic_destroy(g_topic);   g_topic = NULL;
+        diaspora_driver_destroy(g_driver); g_driver = NULL;
+        return;
+    }
+
+    if (getenv("DARSHAN_MOFKA_VERBOSE"))
+        darshan_core_fprintf(stderr, "darshan-mofka: producer connected to topic '%s' "
+                "(batch_size=%zu max_num_batches=%zu)\n",
+                topic_name, batch_size, max_batches);
+
+    g_async = 1;
+    { const char* a = getenv("DARSHAN_MOFKA_ASYNC");
+      if (a && a[0] == '0') g_async = 0; }
+    if (g_async) {
+        const char* e;
+        g_qdepth = 65536;
+        if ((e = getenv("DARSHAN_MOFKA_QUEUE_DEPTH")) && *e) {
+            size_t q = (size_t)strtoull(e, NULL, 10);
+            if (q >= 2) g_qdepth = q;
+        }
+        g_block = 0;
+        if ((e = getenv("DARSHAN_MOFKA_DROP_POLICY")) && strcmp(e, "block") == 0) g_block = 1;
+        g_ndrain = 1;
+        if ((e = getenv("DARSHAN_MOFKA_DRAIN_THREADS")) && *e) {
+            int nd = (int)strtol(e, NULL, 10);
+            if (nd >= 1 && nd <= MOFKA_MAX_DRAIN) g_ndrain = nd;
+        }
+        g_stop = 0; g_head = g_tail = 0;
+        g_ring = calloc(g_qdepth, sizeof(*g_ring));
+        if (g_ring == NULL) {
+            darshan_core_fprintf(stderr, "darshan-mofka: ring calloc(%zu) failed; "
+                    "falling back to synchronous push.\n", g_qdepth);
+            g_async = 0;
+        } else {
+            int started = 0, i;
+            for (i = 0; i < g_ndrain; i++)
+                if (pthread_create(&g_drain[i], NULL, mofka_drain_main, NULL) == 0) started++;
+            g_ndrain = started;
+            if (started == 0) {
+                darshan_core_fprintf(stderr, "darshan-mofka: no drain thread started; "
+                        "falling back to synchronous push.\n");
+                free(g_ring); g_ring = NULL; g_async = 0;
+            } else {
+                pthread_atfork(mofka_atfork_prepare, mofka_atfork_parent, mofka_atfork_child);
+                if (getenv("DARSHAN_MOFKA_VERBOSE"))
+                    darshan_core_fprintf(stderr, "darshan-mofka: async ON "
+                            "(qdepth=%zu drain_threads=%d drop_policy=%s)\n",
+                            g_qdepth, g_ndrain, g_block ? "block" : "drop");
+            }
+        }
+    }
+
+    mofka_took("initialize", t0);
+}
+
+/* Hot path: assign seq, snapshot the op into the ring (sync mode pushes inline). */
 void darshan_mofka_connector_send(uint64_t record_id, int64_t rank,
                                   int64_t record_count, char* rwo,
                                   int64_t offset, int64_t length,
@@ -432,23 +409,18 @@ void darshan_mofka_connector_send(uint64_t record_id, int64_t rank,
     size_t next;
     double t0;
 
-    /* Gate on the disabled/reentrant state BEFORE any work: when the connector is
-     * off (g_producer == NULL, e.g. DARSHAN_MOFKA_ENABLE=0) the hooked op pays
-     * nothing, so the runtime-only baseline is truly zero-overhead and the overhead
-     * A/B measures only real streaming cost. (Matches the upstream LDMS early-out.) */
     if (g_producer == NULL || g_in_send) return;
-    if (rec_size > MOFKA_REC_MAX) return;   /* variable/heatmap module: skip (as before) */
+    if (rec_size > MOFKA_REC_MAX) return;
     g_in_send = 1;
     t0 = darshan_core_wtime();
 
-    /* seq is assigned HERE, on the app thread, in op-issue order -- the reconstructor's
-     * last-writer-wins key. Escaping the record name also happens here (the core name
-     * hash is walked while app threads may register; keep it off the drain thread). */
+    /* seq assigned here, on the app thread, in issue order -- the reconstructor's
+     * max-seq dedup key depends on it reflecting issue, not drain, order. */
     seq = (unsigned long long)atomic_fetch_add(&g_seq, 1);
     file_path = (const char*)darshan_core_lookup_record_name(record_id);
 
     if (!g_async) {
-        /* Synchronous fallback: build a stack slot and push inline. */
+
         struct mofka_slot ss;
         mofka_emit_metadata_once();
         ss.record_id=record_id; ss.rank=rank; ss.record_count=record_count;
@@ -463,17 +435,16 @@ void darshan_mofka_connector_send(uint64_t record_id, int64_t rank,
         goto out;
     }
 
-    /* Async: enqueue a snapshot; the drain thread does serialize+push. */
     pthread_mutex_lock(&g_qmtx);
     next = (g_head + 1) % g_qdepth;
-    if (next == g_tail) {                    /* ring full */
+    if (next == g_tail) {
         if (g_block) {
             while (next == g_tail && !g_stop)
-                pthread_cond_wait(&g_notfull, &g_qmtx);   /* lossless: backpressure */
+                pthread_cond_wait(&g_notfull, &g_qmtx);
         }
-        if (next == g_tail) {                /* still full (drop mode, or stopping) */
+        if (next == g_tail) {
             pthread_mutex_unlock(&g_qmtx);
-            atomic_fetch_add(&g_dropped, 1); /* UDP: push-and-forget, drop */
+            atomic_fetch_add(&g_dropped, 1);
             goto out;
         }
     }
@@ -495,23 +466,14 @@ out:
     g_in_send = 0;
 }
 
-/* Opt-in (DARSHAN_MOFKA_FINAL_SWEEP=1): re-stream every in-memory module record's FINAL struct at
- * shutdown, recovering records whose live ops were no-ops because they fired during the ~200ms
- * producer-init window (e.g. python-ml interpreter-startup files). Re-sending live-streamed records
- * is harmless (reconstruct keeps the max-seq snapshot); op="FINAL" adds no heatmap bins, so this only
- * completes COUNTERS. Must run BEFORE mod_cleanup_func() frees the record buffers.
- *
- * KNOWN ISSUE -- DISABLED BY DEFAULT. Enabled, the first push here hangs on python-ml: these are NEW
- * sends from the shutdown context, and mofka's producer sender runs on the margo *progress* pool, so
- * a send RPC started as the process winds down never progresses (live sends work; the process is
- * still active). A proper fix is mofka-side (dedicated non-progress pool), out of scope here. */
+/* Opt-in (DARSHAN_MOFKA_FINAL_SWEEP=1): re-stream every module's final record at
+ * shutdown. OFF by default -- enabling it hangs python-ml (see the guard below). */
 void darshan_mofka_connector_flush_records(struct darshan_core_runtime* core)
 {
     int m;
 
     if (g_producer == NULL || core == NULL) return;
-    /* Off unless explicitly enabled: unset, "", and "0" all mean OFF (a plain NULL check would
-     * treat "0" as on). See the KNOWN ISSUE note above -- enabling this hangs python-ml. */
+
     { const char* sw = getenv("DARSHAN_MOFKA_FINAL_SWEEP");
       if (sw == NULL || sw[0] == '\0' || sw[0] == '0') return; }
 
@@ -522,11 +484,11 @@ void darshan_mofka_connector_flush_records(struct darshan_core_runtime* core)
         size_t stride;
 
         if (mod == NULL) continue;
-        stride = mod->rec_size;              /* fixed per-record stride captured at register */
+        stride = mod->rec_size;
         if (stride == 0) continue;
 
         p   = (char*) mod->rec_buf_start;
-        end = (char*) mod->rec_buf_p;        /* next free byte: records live in [start, p) */
+        end = (char*) mod->rec_buf_p;
         for (; p && p + stride <= end; p += stride)
         {
             struct darshan_base_record* b = (struct darshan_base_record*) p;
@@ -540,6 +502,8 @@ void darshan_mofka_connector_flush_records(struct darshan_core_runtime* core)
     }
 }
 
+/* Stop + join the drain thread(s), flush pending batches, tear down the producer.
+ * Bounded join: on timeout, leak the producer/ring to avoid a shutdown hang. */
 void darshan_mofka_connector_finalize(void)
 {
     int rc;
@@ -549,12 +513,6 @@ void darshan_mofka_connector_finalize(void)
 
     t0 = darshan_core_wtime();
 
-    /* Stop the drain thread(s) and let the ring finish. All enqueued ops are pushed
-     * by the drain thread (never by finalize itself -- issuing NEW sends from the
-     * shutdown context is exactly what hangs the disabled sweep, see the note above),
-     * so this only JOINS. Bounded join: on timeout, leak the producer and skip the
-     * flush/destroy (diaspora_c.h:120-123 -- destructors may re-contact a dead broker
-     * and hang exit; the OS reclaims everything anyway). */
     if (g_async && g_ndrain > 0) {
         int i, all_joined = 1;
         struct timespec ts;
@@ -575,8 +533,8 @@ void darshan_mofka_connector_finalize(void)
         if (!all_joined) {
             darshan_core_fprintf(stderr, "darshan-mofka: drain join timed out; "
                     "leaking producer to avoid a shutdown hang.\n");
-            g_producer = NULL;   /* skip flush+destroy below */
-            g_leak_ring = 1;     /* a stuck drain thread may still read g_ring: don't free it */
+            g_producer = NULL;
+            g_leak_ring = 1;
         }
     }
 
@@ -584,7 +542,6 @@ void darshan_mofka_connector_finalize(void)
       if (d) darshan_core_fprintf(stderr, "darshan-mofka: dropped %llu events (ring full); "
               "raise DARSHAN_MOFKA_QUEUE_DEPTH or use DARSHAN_MOFKA_DROP_POLICY=block\n", d); }
 
-    /* "The last push is a flush": drain Mofka's own pending batches once. */
     if (g_producer) {
         const char* fe = getenv("DARSHAN_MOFKA_FLUSH_MS");
         unsigned flush_ms = (fe && *fe) ? (unsigned)strtoul(fe, NULL, 10) : 5000;
@@ -598,8 +555,7 @@ void darshan_mofka_connector_finalize(void)
     mofka_took("finalize", t0);
 
 clear:
-    /* Tear down on every path (including flush timeout) rather than leaking --
-     * order matches the diaspora_c.h example: producer, then topic, then driver. */
+
     if (g_producer) { diaspora_producer_destroy(g_producer); g_producer = NULL; }
     if (g_topic)    { diaspora_topic_destroy(g_topic);       g_topic = NULL; }
     if (g_driver)   { diaspora_driver_destroy(g_driver);     g_driver = NULL; }
@@ -608,11 +564,7 @@ clear:
 
 #else
 
-/* One API, LDMS-style: with Mofka unavailable, every connector entry point is a
- * stubbed no-op body (mirrors the #else stubs for darshan_ldms_connector_* in
- * darshan-ldms.c). The module hooks call darshan_mofka_connector_send() directly
- * -- no macro -- so these empty definitions let a !HAVE_MOFKA build link. The
- * compiler elides the empty calls. darshan-core.c still #ifdef-guards init/finalize. */
+/* !HAVE_MOFKA: no-op stubs so the module hooks still link (mirrors darshan-ldms.c). */
 
 void darshan_mofka_connector_initialize(struct darshan_core_runtime *init_core)
 {
@@ -648,4 +600,4 @@ void darshan_mofka_connector_finalize(void)
     return;
 }
 
-#endif /* HAVE_MOFKA */
+#endif
