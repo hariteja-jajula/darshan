@@ -225,9 +225,12 @@ static void mofka_serialize_and_push(const struct mofka_slot* s)
 
     if (n < 0 || (size_t)n >= sizeof(buf)) return;
 
+    /* the real push; in async mode this runs on the drain thread, not in send() */
+    double pt0 = darshan_core_wtime();
     if (diaspora_producer_push(g_producer, buf, NULL, 0) != DIASPORA_C_OK)
         darshan_core_fprintf(stderr, "darshan-mofka: push failed (%s)\n",
                 diaspora_c_last_error());
+    mofka_took("push", pt0);
 }
 
 /* Drain thread: pop snapshots off the ring and serialize+push them. */
