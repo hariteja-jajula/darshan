@@ -269,7 +269,8 @@ void darshan_mofka_connector_initialize(struct darshan_core_runtime* init_core)
     char pname[64];
     double t0 = darshan_core_wtime();
 
-    g_timing = (getenv("DARSHAN_MOFKA_TIMING") != NULL);
+    { const char* v = getenv("DARSHAN_MOFKA_TIMING");
+      g_timing = (v && v[0] && strcmp(v, "0")); }
     g_pid = (long)(init_core ? init_core->pid : getpid());
 
     { const char* r = getenv("OMPI_COMM_WORLD_RANK");
