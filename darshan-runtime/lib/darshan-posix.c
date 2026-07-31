@@ -1420,6 +1420,7 @@ off_t DARSHAN_DECL(lseek)(int fd, off_t offset, int whence)
                 rec_ref->file_rec->fcounters[POSIX_F_META_TIME],
                 tm1, tm2, rec_ref->last_meta_end);
             rec_ref->file_rec->counters[POSIX_SEEKS] += 1;
+            darshan_mofka_connector_send(rec_ref->file_rec->base_rec.id, rec_ref->file_rec->base_rec.rank, rec_ref->file_rec->counters[POSIX_SEEKS], "seek", ret, -1, -1, -1, -1, tm1, tm2, rec_ref->file_rec->fcounters[POSIX_F_META_TIME], "POSIX", "MOD", (const void*)rec_ref->file_rec, sizeof(*rec_ref->file_rec));
         }
         POSIX_POST_RECORD();
     }
@@ -1451,6 +1452,7 @@ off64_t DARSHAN_DECL(lseek64)(int fd, off64_t offset, int whence)
                 rec_ref->file_rec->fcounters[POSIX_F_META_TIME],
                 tm1, tm2, rec_ref->last_meta_end);
             rec_ref->file_rec->counters[POSIX_SEEKS] += 1;
+            darshan_mofka_connector_send(rec_ref->file_rec->base_rec.id, rec_ref->file_rec->base_rec.rank, rec_ref->file_rec->counters[POSIX_SEEKS], "seek", ret, -1, -1, -1, -1, tm1, tm2, rec_ref->file_rec->fcounters[POSIX_F_META_TIME], "POSIX", "MOD", (const void*)rec_ref->file_rec, sizeof(*rec_ref->file_rec));
         }
         POSIX_POST_RECORD();
     }

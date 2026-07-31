@@ -879,14 +879,7 @@ static int write_log(const char *outfile, struct stream_record *records,
 
     (void)max_rank;
 
-    HASH_ITER(hlink, records, rec, tmp)
-    {
-        if(rec->key.pid != target_pid) continue;
-        if(record_is_empty(rec->key.mod_id, rec->buf,
-            lookup_record_name(name_hash, rec->key.record_id))) continue;
-        DARSHAN_MOD_FLAG_SET(partial, rec->key.mod_id);
-    }
-
+    /* partial stays 0: a reconstructed log contains every streamed record (not memory-limited). */
     out = darshan_log_create(outfile, DARSHAN_ZLIB_COMP, partial);
     if(!out)
     {
