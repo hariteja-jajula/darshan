@@ -197,30 +197,26 @@ static void mofka_serialize_and_push(const struct mofka_slot* s)
     if (s->rec_size > 0)
         hex_into(rec_hex, sizeof(rec_hex), s->rec, s->rec_size);
 
+    /* SLIM ENVELOPE: only the fields darshan-mofka-reconstruct.c actually reads from a
+     * module event -- module, record_id, rank, pid, rec_size, seq, file, op, len,
+     * started_at, ended_at, rec_hex. The full record is inside rec_hex, so the parsed
+     * counters (cnt/off/max_byte/switches/flushes/dur/total) were pure duplication; and
+     * uid/job_id/hostname/t0_epoch are supplied once by the metadata event (reconstruct
+     * uses have_* guards). Dropping them ~halves each message -> higher drain throughput.
+     * (op/len/started_at/ended_at are kept: reconstruct's heatmap needs them.) */
     n = snprintf(buf, sizeof(buf),
         MOFKA_ENV_HEAD
-        "\"activity_id\":\"darshan_%s\","
-        "\"task_id\":\"darshan-%016llx-%ld-%llu\","
         MOFKA_ENV_SCHEMA
-        "\"module\":\"%s\",\"event_type\":\"%s\",\"op\":\"%s\","
-        "\"record_id\":\"%016llx\",\"file\":\"%s\","
-        MOFKA_ENV_IDENT
-        "\"rank\":%lld,\"seq\":%llu,\"t0_epoch\":%.6f,"
-        "\"cnt\":%lld,\"off\":%lld,\"len\":%lld,\"max_byte\":%lld,"
-        "\"switches\":%lld,\"flushes\":%lld,"
-        "\"started_at\":%.6f,\"ended_at\":%.6f,\"dur\":%.6f,\"total\":%.6f,"
+        "\"module\":\"%s\",\"op\":\"%s\","
+        "\"record_id\":\"%016llx\",\"file\":\"%s\",\"pid\":%ld,"
+        "\"rank\":%lld,\"seq\":%llu,"
+        "\"len\":%lld,\"started_at\":%.6f,\"ended_at\":%.6f,"
         "\"rec_size\":%llu,\"rec_hex\":\"%s\"}",
         s->mod_name ? s->mod_name : "?",
-        (unsigned long long)s->record_id, g_pid, s->seq,
-        s->mod_name ? s->mod_name : "?",
-        s->data_type ? s->data_type : "?",
         s->rwo ? s->rwo : "?",
-        (unsigned long long)s->record_id, s->file_esc,
-        g_host_esc, g_pid, (long long)g_uid, (long long)g_jobid,
-        (long long)(g_launcher_rank >= 0 ? g_launcher_rank : s->rank), s->seq, g_t0_epoch,
-        (long long)s->record_count, (long long)s->offset, (long long)s->length,
-        (long long)s->max_byte, (long long)s->rw_switch, (long long)s->flushes,
-        started_epoch, ended_epoch, s->end_time - s->start_time, s->total_time,
+        (unsigned long long)s->record_id, s->file_esc, g_pid,
+        (long long)(g_launcher_rank >= 0 ? g_launcher_rank : s->rank), s->seq,
+        (long long)s->length, started_epoch, ended_epoch,
         (unsigned long long)s->rec_size, rec_hex);
 
     if (n < 0 || (size_t)n >= sizeof(buf)) return;
