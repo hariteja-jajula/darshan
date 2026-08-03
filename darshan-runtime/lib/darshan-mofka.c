@@ -61,6 +61,7 @@ static pthread_t       g_drain[MOFKA_MAX_DRAIN];
 static int             g_ndrain;
 static volatile int    g_stop;
 static int             g_leak_ring;
+static int             g_leak_engine;
 static atomic_ullong   g_dropped;
 
 static char    g_hostname[256];
@@ -260,7 +261,7 @@ void darshan_mofka_connector_initialize(struct darshan_core_runtime* init_core)
 {
     const char* group_file;
     const char* topic_name;
-    char opts[1200];
+    char opts[4096];
     char gf_esc[1024];
     char pname[64];
     double t0 = darshan_core_wtime();
@@ -314,7 +315,27 @@ void darshan_mofka_connector_initialize(struct darshan_core_runtime* init_core)
     }
 
     json_escape_into(gf_esc, sizeof(gf_esc), group_file);
-    snprintf(opts, sizeof(opts), "{\"group_file\":\"%s\"}", gf_esc);
+    /* Optional margo/engine config passthrough. When DARSHAN_MOFKA_MARGO_JSON is
+     * set, its value is spliced verbatim as the "margo" object in the driver opts,
+     * so the client engine's progress thread can be configured (e.g. the yielding
+     * basic_wait scheduler that mirrors Mofka's own start_progress_thread(), or
+     * rpc_thread_count:0). MofkaDriver::create reads config.value("margo", ...) and
+     * forwards it into the thallium engine. When unset, opts is byte-identical to
+     * the previous {"group_file":...} so existing baselines are unchanged.
+     * The value must be a valid JSON object, e.g.:
+     *   DARSHAN_MOFKA_MARGO_JSON='{"use_progress_thread":true,"rpc_thread_count":0,
+     *     "argobots":{"pools":[{"name":"__progress__","kind":"fifo_wait","access":"mpmc"}],
+     *     "xstreams":[{"name":"__progress__","scheduler":{"type":"basic_wait","pools":["__progress__"]}}]}}
+     */
+    { const char* mj = getenv("DARSHAN_MOFKA_MARGO_JSON");
+      if (mj && *mj)
+          snprintf(opts, sizeof(opts),
+                   "{\"group_file\":\"%s\",\"margo\":%s}", gf_esc, mj);
+      else
+          snprintf(opts, sizeof(opts), "{\"group_file\":\"%s\"}", gf_esc); }
+
+    if (getenv("DARSHAN_MOFKA_VERBOSE"))
+        darshan_core_fprintf(stderr, "darshan-mofka: driver opts: %s\n", opts);
 
     g_driver = diaspora_driver_create("mofka", opts);
     if (g_driver == NULL) {
@@ -332,8 +353,18 @@ void darshan_mofka_connector_initialize(struct darshan_core_runtime* init_core)
     }
 
     snprintf(pname, sizeof(pname), "darshan-%ld", g_pid);
-    g_producer = diaspora_producer_create(g_topic, pname, batch_size, max_batches,
-                                          DIASPORA_C_ORDERING_LOOSE);
+    /* Dedicated sender thread pool. With the mofka driver the default pool is the
+     * margo progress pool; parking the blocking send RPC there makes the sender ULT
+     * compete with network progress and can wedge mid-run under broker backpressure
+     * (root cause of the observed hang). Default to 1 dedicated Argobots ES for the
+     * sender; 0 restores the legacy (progress-pool) path for A/B testing. */
+    size_t producer_threads = 1;
+    { const char* e = getenv("DARSHAN_MOFKA_PRODUCER_THREADS");
+      if (e && *e) producer_threads = (size_t)strtoull(e, NULL, 10); }
+    g_producer = diaspora_producer_create_ex(g_driver, g_topic, pname,
+                                             batch_size, max_batches,
+                                             DIASPORA_C_ORDERING_LOOSE,
+                                             producer_threads);
     if (g_producer == NULL) {
         darshan_core_fprintf(stderr, "darshan-mofka: producer_create failed (%s)\n",
                 diaspora_c_last_error());
@@ -344,8 +375,8 @@ void darshan_mofka_connector_initialize(struct darshan_core_runtime* init_core)
 
     if (getenv("DARSHAN_MOFKA_VERBOSE"))
         darshan_core_fprintf(stderr, "darshan-mofka: producer connected to topic '%s' "
-                "(batch_size=%zu max_num_batches=%zu)\n",
-                topic_name, batch_size, max_batches);
+                "(batch_size=%zu max_num_batches=%zu producer_threads=%zu)\n",
+                topic_name, batch_size, max_batches, producer_threads);
 
     g_async = 1;
     { const char* a = getenv("DARSHAN_MOFKA_ASYNC");
@@ -532,9 +563,14 @@ void darshan_mofka_connector_finalize(void)
         g_async = 0; g_ndrain = 0;
         if (!all_joined) {
             darshan_core_fprintf(stderr, "darshan-mofka: drain join timed out; "
-                    "leaking producer to avoid a shutdown hang.\n");
+                    "leaking producer+engine to avoid a shutdown hang.\n");
             g_producer = NULL;
             g_leak_ring = 1;
+            /* the drain thread is wedged inside a mercury/margo call that will not
+             * return (progress cannot complete) -- destroying the topic/driver/engine
+             * from here would deadlock the same way. Leak them; the process is exiting
+             * and the OS reclaims everything. */
+            g_leak_engine = 1;
         }
     }
 
@@ -555,6 +591,20 @@ void darshan_mofka_connector_finalize(void)
     mofka_took("finalize", t0);
 
 clear:
+
+    /* Fire-and-forget exit: when the engine is wedged (drain join timed out) or the caller
+     * requests it (DARSHAN_MOFKA_FAST_EXIT=1), skip the diaspora/mercury teardown entirely.
+     * diaspora_driver_destroy() drives the mercury engine's finalize, which deadlocks if the
+     * progress loop cannot complete (the exact atexit hang we hit on tcp AND cxi). The process
+     * is exiting anyway, so leaking these handles is safe -- the OS reclaims the memory, sockets,
+     * and NIC resources. This is what lets an overhead run terminate and emit its result. */
+    { const char* fx = getenv("DARSHAN_MOFKA_FAST_EXIT");
+      if ((fx && fx[0] == '1') || g_leak_engine) {
+          if (getenv("DARSHAN_MOFKA_VERBOSE"))
+              darshan_core_fprintf(stderr, "darshan-mofka: fast-exit -- leaking engine handles "
+                      "(skip mercury teardown to avoid shutdown deadlock)\n");
+          return;
+      } }
 
     if (g_producer) { diaspora_producer_destroy(g_producer); g_producer = NULL; }
     if (g_topic)    { diaspora_topic_destroy(g_topic);       g_topic = NULL; }
