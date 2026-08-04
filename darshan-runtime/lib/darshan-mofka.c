@@ -260,7 +260,7 @@ void darshan_mofka_connector_initialize(struct darshan_core_runtime* init_core)
 {
     const char* group_file;
     const char* topic_name;
-    char opts[1200];
+    char opts[4096];
     char gf_esc[1024];
     char pname[64];
     double t0 = darshan_core_wtime();
@@ -313,8 +313,42 @@ void darshan_mofka_connector_initialize(struct darshan_core_runtime* init_core)
         return;
     }
 
+    /* --- client-engine margo config -------------------------------------
+     * A pure producer never serves incoming RPCs, so we drop the rpc threads and
+     * run a dedicated progress thread. The fixed-field form below is built from
+     * three env-overridable knobs; for full control (custom argobots pools/xstreams,
+     * cpubind, etc.) set DARSHAN_MOFKA_MARGO_JSON and its value is spliced in AS-IS
+     * as the entire "margo" object.
+     *   DARSHAN_MOFKA_PROGRESS_TIMEOUT_MS  progress_timeout_ub_msec (default 100)
+     *   DARSHAN_MOFKA_RPC_THREADS          rpc_thread_count         (default 0)
+     *   DARSHAN_MOFKA_PROGRESS_THREAD      use_progress_thread      (default 1)
+     *   DARSHAN_MOFKA_MARGO_JSON           verbatim "margo" object (overrides above)
+     */
+    long prog_to = 100, rpc_thr = 0, prog_thread = 1;
+    { const char* e;
+      if ((e = getenv("DARSHAN_MOFKA_PROGRESS_TIMEOUT_MS")) && *e) prog_to     = strtol(e, NULL, 10);
+      if ((e = getenv("DARSHAN_MOFKA_RPC_THREADS"))         && *e) rpc_thr     = strtol(e, NULL, 10);
+      if ((e = getenv("DARSHAN_MOFKA_PROGRESS_THREAD"))     && *e) prog_thread = strtol(e, NULL, 10); }
+    if (prog_to < 0) prog_to = 0;
+    if (rpc_thr < 0) rpc_thr = 0;
+
     json_escape_into(gf_esc, sizeof(gf_esc), group_file);
-    snprintf(opts, sizeof(opts), "{\"group_file\":\"%s\"}", gf_esc);
+    { const char* margo_json = getenv("DARSHAN_MOFKA_MARGO_JSON");
+      if (margo_json && *margo_json) {
+        /* Verbatim margo object -- caller owns the JSON. */
+        snprintf(opts, sizeof(opts),
+            "{\"group_file\":\"%s\",\"margo\":%s}", gf_esc, margo_json);
+      } else {
+        snprintf(opts, sizeof(opts),
+            "{\"group_file\":\"%s\","
+            "\"margo\":{\"use_progress_thread\":%s,"
+            "\"progress_timeout_ub_msec\":%ld,"
+            "\"rpc_thread_count\":%ld}}",
+            gf_esc, prog_thread ? "true" : "false", prog_to, rpc_thr);
+      }
+    }
+    if (g_timing)
+        darshan_core_fprintf(stderr, "darshan-mofka[cfg] margo opts: %s\n", opts);
 
     g_driver = diaspora_driver_create("mofka", opts);
     if (g_driver == NULL) {
