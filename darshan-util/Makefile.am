@@ -87,7 +87,8 @@ darshan_merge_SOURCES = darshan-merge.c
 darshan_merge_LDADD = libdarshan-util.la
 
 darshan_mofka_reconstruct_SOURCES = darshan-mofka-reconstruct.c
-darshan_mofka_reconstruct_LDADD = libdarshan-util.la
+# -lm: reconstruct uses ceil()/floor() for heatmap bin sizing (the only util tool that does).
+darshan_mofka_reconstruct_LDADD = libdarshan-util.la -lm
 
 BUILT_SOURCES = uthash-1.9.2
 

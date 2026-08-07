@@ -32,7 +32,6 @@ static diaspora_producer_t* g_producer;
 static atomic_ullong g_seq;
 static __thread int  g_in_send;
 
-#define MOFKA_REC_MAX   1024
 #define MOFKA_MAX_DRAIN 16
 
 /* One I/O event, snapshotted on the app thread and drained off it. */
@@ -45,8 +44,6 @@ struct mofka_slot {
     const char *mod_name;
     const char *data_type;
     char     file_esc[1024];
-    uint32_t rec_size;
-    unsigned char rec[MOFKA_REC_MAX];
 };
 
 static int             g_async;
@@ -111,19 +108,6 @@ static void json_escape_into(char* dst, size_t dstsz, const char* src)
     dst[o] = '\0';
 }
 
-/* Hex-encode n bytes of src into dst; always NUL-terminates. */
-static void hex_into(char* dst, size_t dstsz, const void* src, uint64_t n)
-{
-    static const char H[] = "0123456789abcdef";
-    const unsigned char* p = (const unsigned char*)src;
-    size_t o = 0; uint64_t i;
-    if (dstsz == 0) return;
-    for (i = 0; i < n && o + 2 < dstsz; i++) {
-        dst[o++] = H[p[i] >> 4]; dst[o++] = H[p[i] & 0xf];
-    }
-    dst[o] = '\0';
-}
-
 /* Push the one-shot job metadata event (exe + mounts, no module record). */
 static void emit_metadata(void)
 {
@@ -184,7 +168,6 @@ static void mofka_atfork_child(void)
 static void mofka_serialize_and_push(const struct mofka_slot* s)
 {
     char buf[MOFKA_JSON_BUF];
-    char rec_hex[4096];
     double started_epoch, ended_epoch;
     int n;
 
@@ -193,31 +176,25 @@ static void mofka_serialize_and_push(const struct mofka_slot* s)
       started_epoch = (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
       ended_epoch   = (double)te.tv_sec + (double)te.tv_nsec / 1e9; }
 
-    rec_hex[0] = '\0';
-    if (s->rec_size > 0)
-        hex_into(rec_hex, sizeof(rec_hex), s->rec, s->rec_size);
-
-    /* SLIM ENVELOPE: only the fields darshan-mofka-reconstruct.c actually reads from a
-     * module event -- module, record_id, rank, pid, rec_size, seq, file, op, len,
-     * started_at, ended_at, rec_hex. The full record is inside rec_hex, so the parsed
-     * counters (cnt/off/max_byte/switches/flushes/dur/total) were pure duplication; and
-     * uid/job_id/hostname/t0_epoch are supplied once by the metadata event (reconstruct
-     * uses have_* guards). Dropping them ~halves each message -> higher drain throughput.
-     * (op/len/started_at/ended_at are kept: reconstruct's heatmap needs them.) */
+    /* SLIM TELEMETRY ENVELOPE: module, op, record_id, file, pid, rank, seq, len,
+     * started_at, ended_at -- exactly the fields darshan-mofka-reconstruct.c's heatmap
+     * path reads (op/len/started_at/ended_at) plus identity (module/record_id/file/pid/
+     * rank/seq). The old rec_hex field hex-encoded the ENTIRE native record struct into
+     * every event (~doubling each message); it is removed -- the native .darshan log,
+     * written by Darshan at process exit and independent of streaming, is the byte-exact
+     * source of truth. The stream is real-time telemetry + heatmap only. */
     n = snprintf(buf, sizeof(buf),
         MOFKA_ENV_HEAD
         MOFKA_ENV_SCHEMA
         "\"module\":\"%s\",\"op\":\"%s\","
         "\"record_id\":\"%016llx\",\"file\":\"%s\",\"pid\":%ld,"
         "\"rank\":%lld,\"seq\":%llu,"
-        "\"len\":%lld,\"started_at\":%.6f,\"ended_at\":%.6f,"
-        "\"rec_size\":%llu,\"rec_hex\":\"%s\"}",
+        "\"len\":%lld,\"started_at\":%.6f,\"ended_at\":%.6f}",
         s->mod_name ? s->mod_name : "?",
         s->rwo ? s->rwo : "?",
         (unsigned long long)s->record_id, s->file_esc, g_pid,
         (long long)(g_launcher_rank >= 0 ? g_launcher_rank : s->rank), s->seq,
-        (long long)s->length, started_epoch, ended_epoch,
-        (unsigned long long)s->rec_size, rec_hex);
+        (long long)s->length, started_epoch, ended_epoch);
 
     if (n < 0 || (size_t)n >= sizeof(buf)) return;
 
@@ -444,7 +421,7 @@ void darshan_mofka_connector_send(uint64_t record_id, int64_t rank,
     double t0;
 
     if (g_producer == NULL || g_in_send) return;
-    if (rec_size > MOFKA_REC_MAX) return;
+    (void)rec; (void)rec_size;   /* native record no longer streamed (rec_hex retired) */
     g_in_send = 1;
     t0 = darshan_core_wtime();
 
@@ -463,8 +440,6 @@ void darshan_mofka_connector_send(uint64_t record_id, int64_t rank,
         ss.start_time=start_time; ss.end_time=end_time; ss.total_time=total_time;
         ss.seq=seq; ss.rwo=rwo; ss.mod_name=mod_name; ss.data_type=data_type;
         json_escape_into(ss.file_esc, sizeof(ss.file_esc), file_path);
-        ss.rec_size=(uint32_t)rec_size;
-        if (rec && rec_size) memcpy(ss.rec, rec, rec_size);
         mofka_serialize_and_push(&ss);
         goto out;
     }
@@ -489,8 +464,6 @@ void darshan_mofka_connector_send(uint64_t record_id, int64_t rank,
     s->start_time=start_time; s->end_time=end_time; s->total_time=total_time;
     s->seq=seq; s->rwo=rwo; s->mod_name=mod_name; s->data_type=data_type;
     json_escape_into(s->file_esc, sizeof(s->file_esc), file_path);
-    s->rec_size=(uint32_t)rec_size;
-    if (rec && rec_size) memcpy(s->rec, rec, rec_size);
     g_head = next;
     pthread_cond_signal(&g_notempty);
     pthread_mutex_unlock(&g_qmtx);

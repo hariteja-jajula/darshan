@@ -966,6 +966,16 @@ static int write_log(const char *outfile, struct stream_record *records,
                     if(pruned_out) (*pruned_out)++;
                     continue;
                 }
+                /* Each output log is a single-process log (nprocs=1), but the
+                 * streamed record buffer still carries its ORIGINAL global rank
+                 * (0..N-1). Darshan's accumulator asserts rank < job_nprocs
+                 * (darshan-logutils-accumulator.c:145), so a record with rank=31
+                 * in an nprocs=1 log aborts darshan-parser and pydarshan's summary
+                 * (Assertion `rank < acc->job_nprocs' / SIGABRT). Normalize the
+                 * base-record rank to 0 -- the sole process of this per-pid log --
+                 * exactly as native nprocs=1 logs carry rank 0. strict_compare
+                 * folds by pid and never reads record rank, so this is compare-safe. */
+                ((struct darshan_base_record *)rec->buf)->rank = 0;
                 ret = mod_logutils[m]->log_put_record(out, rec->buf);
                 if(ret < 0)
                 {
@@ -1156,9 +1166,13 @@ int main(int argc, char **argv)
     if(ret < 0)
         return 1;
 
-    if(HASH_CNT(hlink, records) == 0)
+    /* rec_hex retired: the stream no longer carries the native record struct, so the
+     * module `records` hash is empty here -- the per-pid heatmap records (from op/len/
+     * started_at/ended_at) are built LATER at build_heatmap_records_for_pid(). Only bail
+     * if there is nothing at all to reconstruct: no module records AND no heatmap ops. */
+    if(HASH_CNT(hlink, records) == 0 && g_hm_n == 0)
     {
-        fprintf(stderr, "Error: no reconstructable module records found in %s\n", argv[1]);
+        fprintf(stderr, "Error: no reconstructable records or heatmap ops found in %s\n", argv[1]);
         free_records(records);
         free_namehash(name_hash);
         free_jobs(jobs);
