@@ -392,6 +392,56 @@ static int json_get_double(const char *line, const char *key, double *out)
     return 1;
 }
 
+/* Parse a JSON array of integers ("key":[1,2,3,...]) into out[0..max-1].
+ * Returns the count actually parsed (0 if key missing / not an array). The
+ * connector (Approach A) emits the full counters[] array at close, in enum
+ * order, so index i here == counter enum i on the runtime side. */
+static int json_get_i64_array(const char *line, const char *key,
+    int64_t *out, int max)
+{
+    const char *p = json_find_value(line, key);
+    int n = 0;
+
+    if(!p || *p != '[') return 0;
+    p++;
+    while(*p && *p != ']' && n < max)
+    {
+        char *end = NULL;
+        long long v;
+        while(*p && (isspace((unsigned char)*p) || *p == ',')) p++;
+        if(*p == ']' || *p == '\0') break;
+        v = strtoll(p, &end, 10);
+        if(end == p) break;            /* not a number -> stop */
+        out[n++] = (int64_t)v;
+        p = end;
+    }
+    return n;
+}
+
+/* Parse a JSON array of doubles ("key":[1.0,2.5,...]) into out[0..max-1].
+ * Returns the count actually parsed. */
+static int json_get_double_array(const char *line, const char *key,
+    double *out, int max)
+{
+    const char *p = json_find_value(line, key);
+    int n = 0;
+
+    if(!p || *p != '[') return 0;
+    p++;
+    while(*p && *p != ']' && n < max)
+    {
+        char *end = NULL;
+        double v;
+        while(*p && (isspace((unsigned char)*p) || *p == ',')) p++;
+        if(*p == ']' || *p == '\0') break;
+        v = strtod(p, &end);
+        if(end == p) break;
+        out[n++] = v;
+        p = end;
+    }
+    return n;
+}
+
 /* Epoch seconds from a key that may be a number OR an ISO datetime string. The
  * consumer (FlowCept) rewrites started_at/ended_at into "YYYY-MM-DD HH:MM:SS.ffffff"
  * (UTC), so a plain numeric parse fails; fall back to strptime + timegm + fraction. */
@@ -475,6 +525,74 @@ static int expected_record_size(int mod_id)
         case DARSHAN_H5D_MOD: return sizeof(struct darshan_hdf5_dataset);
         default: return -1;
     }
+}
+
+/* Number of int64 counters[] and double fcounters[] a module's record carries.
+ * Mirrors mofka_record_dims() in the connector: both sides share the same
+ * darshan-*-log-format.h, so the array index == counter enum on both ends. Only
+ * the modules the connector snapshots (POSIX/STDIO) are handled; extend here in
+ * lockstep with the connector if more modules start emitting counter arrays. */
+static int module_record_dims(int mod_id, int *nctr, int *nfctr)
+{
+    switch(mod_id)
+    {
+        case DARSHAN_POSIX_MOD: *nctr = POSIX_NUM_INDICES; *nfctr = POSIX_F_NUM_INDICES; return 1;
+        case DARSHAN_STDIO_MOD: *nctr = STDIO_NUM_INDICES; *nfctr = STDIO_F_NUM_INDICES; return 1;
+        default: *nctr = 0; *nfctr = 0; return 0;
+    }
+}
+
+/* Build a native module record from the streamed counters[]/fcounters[] arrays
+ * (Approach A: the connector snapshots the finished record at close and emits the
+ * arrays as JSON numbers). Returns a malloc'd buffer of expected_record_size(mod_id)
+ * with base_rec.id/rank set and the arrays copied in at their struct offsets, or
+ * NULL if the line carries no usable counter array. enum order == array index on
+ * both ends by construction (shared log-format headers), so a plain positional copy
+ * is exact -- no field-by-field mapping needed. */
+static void *build_record_from_arrays(const char *line, int mod_id,
+    uint64_t record_id, int64_t rank, size_t exp_size, size_t *out_len)
+{
+    int nctr = 0, nfctr = 0;
+    int gotc, gotf;
+    struct darshan_base_record base;
+    char *buf;
+    int64_t *ctr_dst;
+    double *fctr_dst;
+    /* stack scratch sized to the largest module we handle */
+    int64_t ctr_tmp[512];
+    double  fctr_tmp[128];
+
+    if(!module_record_dims(mod_id, &nctr, &nfctr) || nctr <= 0) return NULL;
+    if(nctr > (int)(sizeof(ctr_tmp)/sizeof(ctr_tmp[0]))) return NULL;
+    if(nfctr > (int)(sizeof(fctr_tmp)/sizeof(fctr_tmp[0]))) return NULL;
+
+    gotc = json_get_i64_array(line, "counters", ctr_tmp, nctr);
+    if(gotc <= 0) return NULL;          /* no array on this line -> caller falls back */
+    gotf = json_get_double_array(line, "fcounters", fctr_tmp, nfctr);
+
+    if((size_t)exp_size < sizeof(struct darshan_base_record)
+                          + (size_t)nctr * sizeof(int64_t)
+                          + (size_t)nfctr * sizeof(double))
+        return NULL;
+
+    buf = calloc(1, exp_size);
+    if(!buf) return NULL;
+
+    memset(&base, 0, sizeof(base));
+    base.id = (darshan_record_id)record_id;
+    base.rank = rank;
+    memcpy(buf, &base, sizeof(base));
+
+    ctr_dst  = (int64_t*)(buf + sizeof(struct darshan_base_record));
+    fctr_dst = (double*)((char*)ctr_dst + (size_t)nctr * sizeof(int64_t));
+
+    /* copy what we parsed; any short array leaves the remainder zero (calloc),
+     * which is the correct Darshan default for an untouched counter. */
+    memcpy(ctr_dst, ctr_tmp, (size_t)gotc * sizeof(int64_t));
+    if(gotf > 0) memcpy(fctr_dst, fctr_tmp, (size_t)gotf * sizeof(double));
+
+    *out_len = exp_size;
+    return buf;
 }
 
 /* Return 1 if a record should be pruned from the reconstructed log.
@@ -802,14 +920,28 @@ static int read_events(const char *path, struct stream_record **records,
 
         exp_size = expected_record_size(mod_id);
         if(exp_size <= 0) goto next;
-        if(rec_size_i > 0 && rec_size_i != exp_size)
+
+        /* Approach A (current stream): the connector emits the finished record's
+         * counters[]/fcounters[] as JSON number arrays on the close event. Build
+         * the native struct straight from those. Only close events carry the
+         * arrays; ordinary per-op events have none and fall through (their heatmap
+         * op was already captured above). The max-seq/last-writer-wins dedup in
+         * add_record() makes the close snapshot (highest seq) win for each file. */
+        buf = build_record_from_arrays(line, mod_id, record_id, rank,
+                                       (size_t)exp_size, &len);
+
+        /* Fallback for OLD logs that still carry rec_hex (pre-Approach-A). */
+        if(!buf)
         {
-            /* For v1, only reconstruct fixed-size records that match this build. */
-            goto next;
+            if(rec_size_i > 0 && rec_size_i != exp_size)
+            {
+                /* Only reconstruct fixed-size records that match this build. */
+                goto next;
+            }
+            hex = json_get_string(line, "rec_hex");
+            buf = decode_hex(hex, (size_t)exp_size, &len);
         }
 
-        hex = json_get_string(line, "rec_hex");
-        buf = decode_hex(hex, (size_t)exp_size, &len);
         if(!buf || len != (size_t)exp_size)
         {
             free(buf);
@@ -1166,10 +1298,12 @@ int main(int argc, char **argv)
     if(ret < 0)
         return 1;
 
-    /* rec_hex retired: the stream no longer carries the native record struct, so the
-     * module `records` hash is empty here -- the per-pid heatmap records (from op/len/
-     * started_at/ended_at) are built LATER at build_heatmap_records_for_pid(). Only bail
-     * if there is nothing at all to reconstruct: no module records AND no heatmap ops. */
+    /* Approach A: the stream carries each record's finished counters[]/fcounters[] on
+     * its close event, so `records` is populated with full per-file POSIX/STDIO records
+     * (built in read_events via build_record_from_arrays). The per-pid heatmap records
+     * (from op/len/started_at/ended_at) are built LATER at build_heatmap_records_for_pid().
+     * Old logs with no counter arrays and no rec_hex yield only heatmap ops; bail only if
+     * there is nothing at all to reconstruct: no module records AND no heatmap ops. */
     if(HASH_CNT(hlink, records) == 0 && g_hm_n == 0)
     {
         fprintf(stderr, "Error: no reconstructable records or heatmap ops found in %s\n", argv[1]);
