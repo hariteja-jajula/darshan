@@ -44,21 +44,11 @@ struct mofka_slot {
     const char *mod_name;
     const char *data_type;
     char     file_esc[1024];
-    /* Optional full-record counter snapshot, taken ONCE per record at its terminal
-     * op (close). NULL for ordinary per-op events (which stay slim -> heatmap only).
-     * snap_buf holds a heap copy of the live file_rec's raw bytes -- the app-thread
-     * cost is a single ~sizeof(record) memcpy per file; the drain thread decodes it
-     * into "counters":[...],"fcounters":[...] JSON (all the snprintf work stays off
-     * the app critical path). This replaces rec_hex: same information for a rich
-     * reconstruct, but as portable JSON number arrays, and only at close. */
     void   *snap_buf;
     size_t  snap_size;
     int     snap_mod;      /* module id of the snapshot (for counter-count lookup) */
 };
 
-/* counters[]/fcounters[] element counts for a module record, for snapshot decode.
- * Both this file and darshan-mofka-reconstruct.c derive these from the shared
- * darshan-*-log-format.h enums, so the array order matches by construction. */
 static void mofka_record_dims(int mod_id, int *nctr, int *nfctr)
 {
     switch (mod_id) {
@@ -180,9 +170,7 @@ static void mofka_emit_metadata_once(void)
  *  Ring buffer + drain thread (the hot path lives here)              *
  * ------------------------------------------------------------------ */
 
-/* fork() doesn't clone the drain thread: lock the ring across the fork, and in
- * the child disable async + null the producer so it streams nothing until its
- * own initialize runs. (Mofka/margo is not fork-safe.) */
+
 static void mofka_atfork_prepare(void) { pthread_mutex_lock(&g_qmtx); }
 static void mofka_atfork_parent(void)  { pthread_mutex_unlock(&g_qmtx); }
 static void mofka_atfork_child(void)
@@ -206,21 +194,7 @@ static void mofka_serialize_and_push(const struct mofka_slot* s)
       started_epoch = (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
       ended_epoch   = (double)te.tv_sec + (double)te.tv_nsec / 1e9; }
 
-    /* SLIM TELEMETRY ENVELOPE: module, op, record_id, file, pid, rank, seq, len,
-     * started_at, ended_at -- the fields darshan-mofka-reconstruct.c's heatmap path
-     * reads (op/len/started_at/ended_at) plus identity (module/record_id/file/pid/
-     * rank/seq). Emitted for EVERY op.
-     *
-     * When a record snapshot is attached (s->snap_buf, taken once at close), the
-     * full per-file counters[]/fcounters[] arrays are appended as JSON numbers so the
-     * reconstructor can rebuild a near-native per-process record (access sizes, I/O
-     * cost, counts, timers). This REPLACES the old rec_hex field: same information,
-     * but portable JSON number arrays instead of a raw-struct hex dump, and only ONCE
-     * per file (at close) instead of on every event. The native .darshan log stays the
-     * byte-exact source of truth; the stream now also carries enough for a rich report.
-     *
-     * Note the envelope is written WITHOUT its closing brace so the arrays (if any)
-     * can be appended before we close it. */
+
     n = snprintf(buf, sizeof(buf),
         MOFKA_ENV_HEAD
         MOFKA_ENV_SCHEMA
@@ -236,9 +210,6 @@ static void mofka_serialize_and_push(const struct mofka_slot* s)
 
     if (n < 0 || (size_t)n >= sizeof(buf)) return;
 
-    /* Append the full-record counter snapshot as JSON number arrays (drain thread:
-     * all the snprintf cost stays off the app critical path). enum order == array
-     * index on both ends (shared darshan-*-log-format.h). */
     if (s->snap_buf) {
         int nctr = 0, nfctr = 0, i;
         mofka_record_dims(s->snap_mod, &nctr, &nfctr);
@@ -373,17 +344,6 @@ void darshan_mofka_connector_initialize(struct darshan_core_runtime* init_core)
         return;
     }
 
-    /* --- client-engine margo config -------------------------------------
-     * A pure producer never serves incoming RPCs, so we drop the rpc threads and
-     * run a dedicated progress thread. The fixed-field form below is built from
-     * three env-overridable knobs; for full control (custom argobots pools/xstreams,
-     * cpubind, etc.) set DARSHAN_MOFKA_MARGO_JSON and its value is spliced in AS-IS
-     * as the entire "margo" object.
-     *   DARSHAN_MOFKA_PROGRESS_TIMEOUT_MS  progress_timeout_ub_msec (default 100)
-     *   DARSHAN_MOFKA_RPC_THREADS          rpc_thread_count         (default 0)
-     *   DARSHAN_MOFKA_PROGRESS_THREAD      use_progress_thread      (default 1)
-     *   DARSHAN_MOFKA_MARGO_JSON           verbatim "margo" object (overrides above)
-     */
     long prog_to = 100, rpc_thr = 0, prog_thread = 1;
     { const char* e;
       if ((e = getenv("DARSHAN_MOFKA_PROGRESS_TIMEOUT_MS")) && *e) prog_to     = strtol(e, NULL, 10);
@@ -510,16 +470,9 @@ void darshan_mofka_connector_send(uint64_t record_id, int64_t rank,
     g_in_send = 1;
     t0 = darshan_core_wtime();
 
-    /* seq assigned here, on the app thread, in issue order -- the reconstructor's
-     * max-seq dedup key depends on it reflecting issue, not drain, order. */
     seq = (unsigned long long)atomic_fetch_add(&g_seq, 1);
     file_path = (const char*)darshan_core_lookup_record_name(record_id);
 
-    /* rec_hex is gone, but we still recover a near-native pydarshan report by
-     * snapshotting the full counter arrays ONCE per record, at its close op. The
-     * reconstructor's max-seq dedup makes the close snapshot (highest seq) win, so
-     * the per-op events stay slim (heatmap) and exactly one fat event carries the
-     * final counters[]/fcounters[] for that file. */
     if (rec != NULL && rec_size > 0 && rwo != NULL && strcmp(rwo, "close") == 0) {
         int mid = mofka_mod_id(mod_name);
         if (mid >= 0) {
