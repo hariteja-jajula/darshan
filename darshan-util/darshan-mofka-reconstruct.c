@@ -392,56 +392,6 @@ static int json_get_double(const char *line, const char *key, double *out)
     return 1;
 }
 
-/* Parse a JSON array of integers ("key":[1,2,3,...]) into out[0..max-1].
- * Returns the count actually parsed (0 if key missing / not an array). The
- * connector (Approach A) emits the full counters[] array at close, in enum
- * order, so index i here == counter enum i on the runtime side. */
-static int json_get_i64_array(const char *line, const char *key,
-    int64_t *out, int max)
-{
-    const char *p = json_find_value(line, key);
-    int n = 0;
-
-    if(!p || *p != '[') return 0;
-    p++;
-    while(*p && *p != ']' && n < max)
-    {
-        char *end = NULL;
-        long long v;
-        while(*p && (isspace((unsigned char)*p) || *p == ',')) p++;
-        if(*p == ']' || *p == '\0') break;
-        v = strtoll(p, &end, 10);
-        if(end == p) break;            /* not a number -> stop */
-        out[n++] = (int64_t)v;
-        p = end;
-    }
-    return n;
-}
-
-/* Parse a JSON array of doubles ("key":[1.0,2.5,...]) into out[0..max-1].
- * Returns the count actually parsed. */
-static int json_get_double_array(const char *line, const char *key,
-    double *out, int max)
-{
-    const char *p = json_find_value(line, key);
-    int n = 0;
-
-    if(!p || *p != '[') return 0;
-    p++;
-    while(*p && *p != ']' && n < max)
-    {
-        char *end = NULL;
-        double v;
-        while(*p && (isspace((unsigned char)*p) || *p == ',')) p++;
-        if(*p == ']' || *p == '\0') break;
-        v = strtod(p, &end);
-        if(end == p) break;
-        out[n++] = v;
-        p = end;
-    }
-    return n;
-}
-
 /* Epoch seconds from a key that may be a number OR an ISO datetime string. The
  * consumer (FlowCept) rewrites started_at/ended_at into "YYYY-MM-DD HH:MM:SS.ffffff"
  * (UTC), so a plain numeric parse fails; fall back to strptime + timegm + fraction. */
@@ -472,37 +422,6 @@ static int hex_value(int c)
     return -1;
 }
 
-static void *decode_hex(const char *hex, size_t expected, size_t *out_len)
-{
-    size_t hex_len, n, i;
-    unsigned char *buf;
-
-    if(!hex) return NULL;
-    hex_len = strlen(hex);
-    if(hex_len % 2 != 0) return NULL;
-    n = hex_len / 2;
-    /* For a fixed-layout module struct, only an exact size match is safe.
-     * Trimming an oversized payload would silently pass a structurally-wrong
-     * record (masking runtime/logutils version skew), so reject it instead. */
-    if(expected > 0 && n != expected) return NULL;
-
-    buf = malloc(n ? n : 1);
-    if(!buf) return NULL;
-    for(i = 0; i < n; i++)
-    {
-        int hi = hex_value((unsigned char)hex[2*i]);
-        int lo = hex_value((unsigned char)hex[2*i + 1]);
-        if(hi < 0 || lo < 0)
-        {
-            free(buf);
-            return NULL;
-        }
-        buf[i] = (unsigned char)((hi << 4) | lo);
-    }
-    *out_len = n;
-    return buf;
-}
-
 static int module_name_to_id(const char *module)
 {
     int i;
@@ -527,72 +446,342 @@ static int expected_record_size(int mod_id)
     }
 }
 
-/* Number of int64 counters[] and double fcounters[] a module's record carries.
- * Mirrors mofka_record_dims() in the connector: both sides share the same
- * darshan-*-log-format.h, so the array index == counter enum on both ends. Only
- * the modules the connector snapshots (POSIX/STDIO) are handled; extend here in
- * lockstep with the connector if more modules start emitting counter arrays. */
-static int module_record_dims(int mod_id, int *nctr, int *nfctr)
+/* ---- PER-OP COUNTER ACCUMULATOR -----------------------------------------
+ *
+ * The stream no longer carries a close-time raw-record snapshot or counters[]/
+ * fcounters[] arrays. Instead the connector emits ONLY the slim per-op envelope
+ * (op/offset/len/started_at/ended_at + identity) for EVERY op, and we DERIVE the
+ * per-file counters here by accumulating those events -- mirroring the runtime's
+ * own per-op counter updates in darshan-posix.c / darshan-stdio.c.
+ *
+ * This (a) removes the snapshot from the stream and (b) fixes the "files still open
+ * at exit have no close snapshot" gap: a record's counters come from the ops we
+ * already saw, so a file that never closes still yields a full record.
+ *
+ * Keyed by (mod_id, record_id, rank, pid) -- same identity write_log groups by.
+ * DARSHAN_BUCKET_INC bucket edges and the SEQ/CONSEC/MAX_BYTE logic are copied
+ * verbatim from the runtime so the derived subset matches native bit-for-bit. */
+
+/* the 10 DARSHAN_BUCKET_INC size buckets; bucket index for a byte count. */
+static int size_bucket(int64_t v)
 {
-    switch(mod_id)
+    if(v < 101) return 0;
+    if(v < 1025) return 1;
+    if(v < 10241) return 2;
+    if(v < 102401) return 3;
+    if(v < 1048577) return 4;
+    if(v < 4194305) return 5;
+    if(v < 10485761) return 6;
+    if(v < 104857601) return 7;
+    if(v < 1073741825) return 8;
+    return 9;
+}
+
+/* Track up to this many distinct access sizes per record for the ACCESS1-4/
+ * COUNT top-4 (native tracks 32 at runtime; 64 is ample for a derived report). */
+#define ACC_MAX_TRACK 64
+
+struct acc_record
+{
+    struct rec_key key;
+
+    int64_t opens, reads, writes, seeks, fdopens, flushes;
+    int64_t bytes_read, bytes_written;
+    int64_t max_byte_read, max_byte_written;
+    int64_t rw_switches;
+    int64_t size_read[10], size_write[10];
+
+    /* consec/seq tracking (mirror runtime rec_ref->last_byte_{read,write}) */
+    int64_t last_byte_read, last_byte_written;
+    int64_t consec_reads, consec_writes, seq_reads, seq_writes;
+    int have_last_read, have_last_write;
+
+    /* cumulative + max timers and first/last timestamps */
+    double read_time, write_time, meta_time;
+    double max_read_time, max_write_time;
+    int64_t max_read_time_size, max_write_time_size;   /* POSIX only */
+    double open_start, open_end, read_start, read_end;
+    double write_start, write_end, close_start, close_end;
+    int have_open_ts, have_read_ts, have_write_ts, have_close_ts;
+
+    /* last op class for rw-switch detection: 0=none, 1=read, 2=write */
+    int last_io_type;
+
+    /* distinct access-size frequency table for ACCESS1-4 */
+    int64_t acc_val[ACC_MAX_TRACK];
+    int64_t acc_cnt[ACC_MAX_TRACK];
+    int acc_n;
+
+    UT_hash_handle hlink;
+};
+
+static struct acc_record *acc_lookup(struct acc_record **accs, int mod_id,
+    uint64_t record_id, int64_t rank, int64_t pid)
+{
+    struct rec_key key;
+    struct acc_record *a;
+
+    memset(&key, 0, sizeof(key));
+    key.mod_id = mod_id;
+    key.record_id = record_id;
+    key.rank = rank;
+    key.pid = pid;
+
+    HASH_FIND(hlink, *accs, &key, sizeof(key), a);
+    if(a) return a;
+    a = calloc(1, sizeof(*a));
+    if(!a) return NULL;
+    a->key = key;
+    HASH_ADD(hlink, *accs, key, sizeof(a->key), a);
+    return a;
+}
+
+/* Record a distinct access-size occurrence for the ACCESS1-4 top-4. */
+static void acc_track_size(struct acc_record *a, int64_t sz)
+{
+    int i;
+    for(i = 0; i < a->acc_n; i++)
+        if(a->acc_val[i] == sz) { a->acc_cnt[i]++; return; }
+    if(a->acc_n < ACC_MAX_TRACK)
     {
-        case DARSHAN_POSIX_MOD: *nctr = POSIX_NUM_INDICES; *nfctr = POSIX_F_NUM_INDICES; return 1;
-        case DARSHAN_STDIO_MOD: *nctr = STDIO_NUM_INDICES; *nfctr = STDIO_F_NUM_INDICES; return 1;
-        default: *nctr = 0; *nfctr = 0; return 0;
+        a->acc_val[a->acc_n] = sz;
+        a->acc_cnt[a->acc_n] = 1;
+        a->acc_n++;
     }
 }
 
-/* Build a native module record from the streamed counters[]/fcounters[] arrays
- * (Approach A: the connector snapshots the finished record at close and emits the
- * arrays as JSON numbers). Returns a malloc'd buffer of expected_record_size(mod_id)
- * with base_rec.id/rank set and the arrays copied in at their struct offsets, or
- * NULL if the line carries no usable counter array. enum order == array index on
- * both ends by construction (shared log-format headers), so a plain positional copy
- * is exact -- no field-by-field mapping needed. */
-static void *build_record_from_arrays(const char *line, int mod_id,
-    uint64_t record_id, int64_t rank, size_t exp_size, size_t *out_len)
+/* Fold one per-op event into its record's accumulator. op/offset/len/timestamps
+ * come straight from the slim envelope. Called once per streamed op event. */
+static void acc_update(struct acc_record *a, const char *op,
+    int64_t offset, int64_t len, double started, double ended)
 {
-    int nctr = 0, nfctr = 0;
-    int gotc, gotf;
-    struct darshan_base_record base;
-    char *buf;
-    int64_t *ctr_dst;
-    double *fctr_dst;
-    /* stack scratch sized to the largest module we handle */
-    int64_t ctr_tmp[512];
-    double  fctr_tmp[128];
+    double dur = (ended > started) ? (ended - started) : 0.0;
+    int is_read = 0, is_write = 0, is_open = 0, is_close = 0, is_seek = 0, is_stat = 0;
 
-    if(!module_record_dims(mod_id, &nctr, &nfctr) || nctr <= 0) return NULL;
-    if(nctr > (int)(sizeof(ctr_tmp)/sizeof(ctr_tmp[0]))) return NULL;
-    if(nfctr > (int)(sizeof(fctr_tmp)/sizeof(fctr_tmp[0]))) return NULL;
+    if(!op) return;
 
-    gotc = json_get_i64_array(line, "counters", ctr_tmp, nctr);
-    if(gotc <= 0) return NULL;          /* no array on this line -> caller falls back */
-    gotf = json_get_double_array(line, "fcounters", fctr_tmp, nfctr);
+    /* classify: match the op strings the wrappers emit. refopen counts as an open. */
+    if(strcmp(op, "read") == 0) is_read = 1;
+    else if(strcmp(op, "write") == 0) is_write = 1;
+    else if(strcmp(op, "open") == 0 || strcmp(op, "refopen") == 0) is_open = 1;
+    else if(strcmp(op, "close") == 0) is_close = 1;
+    else if(strcmp(op, "seek") == 0) is_seek = 1;
+    else if(strcmp(op, "stat") == 0) is_stat = 1;
+    else return;   /* FINAL / unknown ops carry no derivable counter */
 
-    if((size_t)exp_size < sizeof(struct darshan_base_record)
-                          + (size_t)nctr * sizeof(int64_t)
-                          + (size_t)nfctr * sizeof(double))
-        return NULL;
+    if(is_read)
+    {
+        if(len < 0) len = 0;
+        /* seq/consec (runtime: this_offset vs last_byte_read) */
+        if(offset >= 0)
+        {
+            if(a->have_last_read && offset > a->last_byte_read) a->seq_reads++;
+            if(a->have_last_read && offset == a->last_byte_read + 1) a->consec_reads++;
+            a->last_byte_read = offset + len - 1;
+            a->have_last_read = 1;
+            if(a->max_byte_read < offset + len - 1) a->max_byte_read = offset + len - 1;
+        }
+        a->bytes_read += len;
+        a->reads++;
+        a->size_read[size_bucket(len)]++;
+        acc_track_size(a, len);
+        a->read_time += dur;
+        if(dur > a->max_read_time) { a->max_read_time = dur; a->max_read_time_size = len; }
+        if(!a->have_read_ts || started < a->read_start) a->read_start = started;
+        a->read_end = ended; a->have_read_ts = 1;
+        if(a->last_io_type == 2) a->rw_switches++;
+        a->last_io_type = 1;
+    }
+    else if(is_write)
+    {
+        if(len < 0) len = 0;
+        if(offset >= 0)
+        {
+            if(a->have_last_write && offset > a->last_byte_written) a->seq_writes++;
+            if(a->have_last_write && offset == a->last_byte_written + 1) a->consec_writes++;
+            a->last_byte_written = offset + len - 1;
+            a->have_last_write = 1;
+            if(a->max_byte_written < offset + len - 1) a->max_byte_written = offset + len - 1;
+        }
+        a->bytes_written += len;
+        a->writes++;
+        a->size_write[size_bucket(len)]++;
+        acc_track_size(a, len);
+        a->write_time += dur;
+        if(dur > a->max_write_time) { a->max_write_time = dur; a->max_write_time_size = len; }
+        if(!a->have_write_ts || started < a->write_start) a->write_start = started;
+        a->write_end = ended; a->have_write_ts = 1;
+        if(a->last_io_type == 1) a->rw_switches++;
+        a->last_io_type = 2;
+    }
+    else if(is_open)
+    {
+        a->opens++;
+        a->meta_time += dur;
+        if(!a->have_open_ts || started < a->open_start) a->open_start = started;
+        a->open_end = ended; a->have_open_ts = 1;
+    }
+    else if(is_close)
+    {
+        a->meta_time += dur;
+        if(!a->have_close_ts || started < a->close_start) a->close_start = started;
+        a->close_end = ended; a->have_close_ts = 1;
+    }
+    else if(is_seek)
+    {
+        a->seeks++;
+        a->meta_time += dur;   /* seeks charge meta time in the runtime */
+    }
+    else if(is_stat)
+    {
+        /* stat/lstat/fstat: charges meta time. The current wrappers do not emit a
+         * "stat" op, so this branch is dormant; kept so POSIX_STATS becomes derivable
+         * the moment a stat op is streamed. (POSIX_STATS itself left 0 until then.) */
+        a->meta_time += dur;
+    }
+}
 
-    buf = calloc(1, exp_size);
+/* Copy the top-4 most frequent access sizes (by count, then by value desc, matching
+ * DARSHAN_UPDATE_COMMON_VAL_COUNTERS ordering) into acc_dst[0..3] / cnt_dst[0..3]. */
+static void acc_emit_top4(const struct acc_record *a,
+    int64_t *acc_dst, int64_t *cnt_dst)
+{
+    int used[ACC_MAX_TRACK];
+    int i, slot;
+    memset(used, 0, sizeof(used));
+    for(slot = 0; slot < 4; slot++)
+    {
+        int best = -1;
+        for(i = 0; i < a->acc_n; i++)
+        {
+            if(used[i]) continue;
+            if(best < 0 ||
+               a->acc_cnt[i] > a->acc_cnt[best] ||
+               (a->acc_cnt[i] == a->acc_cnt[best] && a->acc_val[i] > a->acc_val[best]))
+                best = i;
+        }
+        if(best < 0) break;
+        used[best] = 1;
+        acc_dst[slot] = a->acc_val[best];
+        cnt_dst[slot] = a->acc_cnt[best];
+    }
+}
+
+/* Materialize an accumulated POSIX/STDIO record into a native module struct.
+ * Returns a malloc'd buffer of expected_record_size(mod_id), or NULL. Only the
+ * DERIVABLE counters are set; the rest stay 0 (Darshan's default for untouched). */
+static void *build_record_from_acc(const struct acc_record *a, size_t exp_size,
+    size_t *out_len)
+{
+    char *buf = calloc(1, exp_size);
+    struct darshan_base_record *base;
     if(!buf) return NULL;
 
-    memset(&base, 0, sizeof(base));
-    base.id = (darshan_record_id)record_id;
-    base.rank = rank;
-    memcpy(buf, &base, sizeof(base));
+    base = (struct darshan_base_record *)buf;
+    base->id = (darshan_record_id)a->key.record_id;
+    base->rank = a->key.rank;
 
-    ctr_dst  = (int64_t*)(buf + sizeof(struct darshan_base_record));
-    fctr_dst = (double*)((char*)ctr_dst + (size_t)nctr * sizeof(int64_t));
+    if(a->key.mod_id == DARSHAN_POSIX_MOD)
+    {
+        struct darshan_posix_file *r = (struct darshan_posix_file *)buf;
+        int64_t *c = r->counters;
+        double *f = r->fcounters;
 
-    /* copy what we parsed; any short array leaves the remainder zero (calloc),
-     * which is the correct Darshan default for an untouched counter. */
-    memcpy(ctr_dst, ctr_tmp, (size_t)gotc * sizeof(int64_t));
-    if(gotf > 0) memcpy(fctr_dst, fctr_tmp, (size_t)gotf * sizeof(double));
+        c[POSIX_OPENS] = a->opens;
+        c[POSIX_READS] = a->reads;
+        c[POSIX_WRITES] = a->writes;
+        c[POSIX_SEEKS] = a->seeks;
+        c[POSIX_BYTES_READ] = a->bytes_read;
+        c[POSIX_BYTES_WRITTEN] = a->bytes_written;
+        c[POSIX_MAX_BYTE_READ] = a->max_byte_read;
+        c[POSIX_MAX_BYTE_WRITTEN] = a->max_byte_written;
+        c[POSIX_CONSEC_READS] = a->consec_reads;
+        c[POSIX_CONSEC_WRITES] = a->consec_writes;
+        c[POSIX_SEQ_READS] = a->seq_reads;
+        c[POSIX_SEQ_WRITES] = a->seq_writes;
+        c[POSIX_RW_SWITCHES] = a->rw_switches;
+        c[POSIX_MAX_READ_TIME_SIZE] = a->max_read_time_size;
+        c[POSIX_MAX_WRITE_TIME_SIZE] = a->max_write_time_size;
+        { int i; for(i = 0; i < 10; i++) {
+            c[POSIX_SIZE_READ_0_100 + i] = a->size_read[i];
+            c[POSIX_SIZE_WRITE_0_100 + i] = a->size_write[i]; } }
+        acc_emit_top4(a, &c[POSIX_ACCESS1_ACCESS], &c[POSIX_ACCESS1_COUNT]);
+
+        f[POSIX_F_OPEN_START_TIMESTAMP] = a->have_open_ts ? a->open_start : 0.0;
+        f[POSIX_F_OPEN_END_TIMESTAMP] = a->have_open_ts ? a->open_end : 0.0;
+        f[POSIX_F_READ_START_TIMESTAMP] = a->have_read_ts ? a->read_start : 0.0;
+        f[POSIX_F_READ_END_TIMESTAMP] = a->have_read_ts ? a->read_end : 0.0;
+        f[POSIX_F_WRITE_START_TIMESTAMP] = a->have_write_ts ? a->write_start : 0.0;
+        f[POSIX_F_WRITE_END_TIMESTAMP] = a->have_write_ts ? a->write_end : 0.0;
+        f[POSIX_F_CLOSE_START_TIMESTAMP] = a->have_close_ts ? a->close_start : 0.0;
+        f[POSIX_F_CLOSE_END_TIMESTAMP] = a->have_close_ts ? a->close_end : 0.0;
+        f[POSIX_F_READ_TIME] = a->read_time;
+        f[POSIX_F_WRITE_TIME] = a->write_time;
+        f[POSIX_F_META_TIME] = a->meta_time;
+        f[POSIX_F_MAX_READ_TIME] = a->max_read_time;
+        f[POSIX_F_MAX_WRITE_TIME] = a->max_write_time;
+
+        /* single-process (nprocs=1) log: this rank is both fastest and slowest */
+        c[POSIX_FASTEST_RANK] = base->rank;
+        c[POSIX_SLOWEST_RANK] = base->rank;
+        c[POSIX_FASTEST_RANK_BYTES] = a->bytes_read + a->bytes_written;
+        c[POSIX_SLOWEST_RANK_BYTES] = a->bytes_read + a->bytes_written;
+        f[POSIX_F_FASTEST_RANK_TIME] = a->read_time + a->write_time + a->meta_time;
+        f[POSIX_F_SLOWEST_RANK_TIME] = a->read_time + a->write_time + a->meta_time;
+    }
+    else if(a->key.mod_id == DARSHAN_STDIO_MOD)
+    {
+        struct darshan_stdio_file *r = (struct darshan_stdio_file *)buf;
+        int64_t *c = r->counters;
+        double *f = r->fcounters;
+
+        c[STDIO_OPENS] = a->opens;
+        c[STDIO_READS] = a->reads;
+        c[STDIO_WRITES] = a->writes;
+        c[STDIO_SEEKS] = a->seeks;
+        c[STDIO_FLUSHES] = a->flushes;
+        c[STDIO_BYTES_WRITTEN] = a->bytes_written;
+        c[STDIO_BYTES_READ] = a->bytes_read;
+        c[STDIO_MAX_BYTE_READ] = a->max_byte_read;
+        c[STDIO_MAX_BYTE_WRITTEN] = a->max_byte_written;
+
+        f[STDIO_F_META_TIME] = a->meta_time;
+        f[STDIO_F_WRITE_TIME] = a->write_time;
+        f[STDIO_F_READ_TIME] = a->read_time;
+        f[STDIO_F_OPEN_START_TIMESTAMP] = a->have_open_ts ? a->open_start : 0.0;
+        f[STDIO_F_OPEN_END_TIMESTAMP] = a->have_open_ts ? a->open_end : 0.0;
+        f[STDIO_F_CLOSE_START_TIMESTAMP] = a->have_close_ts ? a->close_start : 0.0;
+        f[STDIO_F_CLOSE_END_TIMESTAMP] = a->have_close_ts ? a->close_end : 0.0;
+        f[STDIO_F_WRITE_START_TIMESTAMP] = a->have_write_ts ? a->write_start : 0.0;
+        f[STDIO_F_WRITE_END_TIMESTAMP] = a->have_write_ts ? a->write_end : 0.0;
+        f[STDIO_F_READ_START_TIMESTAMP] = a->have_read_ts ? a->read_start : 0.0;
+        f[STDIO_F_READ_END_TIMESTAMP] = a->have_read_ts ? a->read_end : 0.0;
+
+        c[STDIO_FASTEST_RANK] = base->rank;
+        c[STDIO_SLOWEST_RANK] = base->rank;
+        c[STDIO_FASTEST_RANK_BYTES] = a->bytes_read + a->bytes_written;
+        c[STDIO_SLOWEST_RANK_BYTES] = a->bytes_read + a->bytes_written;
+        f[STDIO_F_FASTEST_RANK_TIME] = a->read_time + a->write_time + a->meta_time;
+        f[STDIO_F_SLOWEST_RANK_TIME] = a->read_time + a->write_time + a->meta_time;
+    }
+    else
+    {
+        free(buf);
+        return NULL;
+    }
 
     *out_len = exp_size;
     return buf;
+}
+
+static void free_accs(struct acc_record *accs)
+{
+    struct acc_record *a, *tmp;
+    HASH_ITER(hlink, accs, a, tmp)
+    {
+        HASH_DELETE(hlink, accs, a);
+        free(a);
+    }
 }
 
 /* Return 1 if a record should be pruned from the reconstructed log.
@@ -848,7 +1037,8 @@ static void hm_capture(int mod_id, int64_t rank, int64_t pid, int is_write,
 
 static int read_events(const char *path, struct stream_record **records,
     struct darshan_name_record_ref **name_hash, int64_t *max_rank,
-    struct job_info **jobs, unsigned long long *event_count)
+    struct job_info **jobs, unsigned long long *event_count,
+    struct acc_record **accs)
 {
     FILE *fp;
     char *line = NULL;
@@ -864,14 +1054,12 @@ static int read_events(const char *path, struct stream_record **records,
 
     while((nread = getline(&line, &cap, fp)) != -1)
     {
-        char *module = NULL, *file = NULL, *hex = NULL;
+        char *module = NULL, *file = NULL, *op = NULL;
         uint64_t record_id = 0;
-        int64_t rank = -1, pid = -1, rec_size_i = 0;
-        unsigned long long seq = 0;
-        double ended_at = 0.0;
+        int64_t rank = -1, pid = -1;
+        int64_t offset = -1, len_bytes = -1;
+        double started_at = 0.0, ended_at = 0.0;
         int mod_id, exp_size;
-        void *buf;
-        size_t len;
         struct job_info *job;
 
         (void)nread;
@@ -890,79 +1078,74 @@ static int read_events(const char *path, struct stream_record **records,
         if(!json_get_u64_hex_or_dec(line, "record_id", &record_id)) goto next;
         json_get_i64(line, "rank", &rank);
         json_get_i64(line, "pid", &pid);
-        json_get_i64(line, "rec_size", &rec_size_i);
-        { uint64_t seq_u = 0; if(json_get_u64(line, "seq", &seq_u)) seq = (unsigned long long)seq_u; }
-        json_get_double(line, "ended_at", &ended_at);
+        json_get_i64(line, "offset", &offset);
+        json_get_i64(line, "len", &len_bytes);
+        json_get_epoch(line, "started_at", &started_at);
+        json_get_epoch(line, "ended_at", &ended_at);
 
-        /* HEATMAP: capture every read/write op for later time-binning, even if
-         * the module record below is filtered out by rec_size. Only the modules
-         * that Darshan populates a heatmap for (POSIX/MPI-IO/STDIO). */
-        if(mod_id == DARSHAN_POSIX_MOD || mod_id == DARSHAN_STDIO_MOD ||
-           mod_id == DARSHAN_MPIIO_MOD)
+        op = json_get_string(line, "op");
+
+        /* HEATMAP: capture every read/write op for later time-binning. Only the
+         * modules Darshan populates a heatmap for (POSIX/MPI-IO/STDIO). */
+        if(op && (mod_id == DARSHAN_POSIX_MOD || mod_id == DARSHAN_STDIO_MOD ||
+                  mod_id == DARSHAN_MPIIO_MOD))
         {
-            char *op = json_get_string(line, "op");
-            if(op)
-            {
-                int is_w = strstr(op, "write") != NULL;
-                int is_r = strstr(op, "read") != NULL;
-                if(is_w || is_r)
-                {
-                    int64_t nbytes = 0;
-                    double s = 0.0, e = 0.0;
-                    json_get_i64(line, "len", &nbytes);
-                    json_get_epoch(line, "started_at", &s);
-                    json_get_epoch(line, "ended_at", &e);
-                    hm_capture(mod_id, rank, pid, is_w, nbytes, s, e);
-                }
-                free(op);
-            }
+            int is_w = strstr(op, "write") != NULL;
+            int is_r = strstr(op, "read") != NULL;
+            if(is_w || is_r)
+                hm_capture(mod_id, rank, pid, is_w, len_bytes, started_at, ended_at);
         }
 
         exp_size = expected_record_size(mod_id);
         if(exp_size <= 0) goto next;
 
-        /* Approach A (current stream): the connector emits the finished record's
-         * counters[]/fcounters[] as JSON number arrays on the close event. Build
-         * the native struct straight from those. Only close events carry the
-         * arrays; ordinary per-op events have none and fall through (their heatmap
-         * op was already captured above). The max-seq/last-writer-wins dedup in
-         * add_record() makes the close snapshot (highest seq) win for each file. */
-        buf = build_record_from_arrays(line, mod_id, record_id, rank,
-                                       (size_t)exp_size, &len);
-
-        /* Fallback for OLD logs that still carry rec_hex (pre-Approach-A). */
-        if(!buf)
-        {
-            if(rec_size_i > 0 && rec_size_i != exp_size)
-            {
-                /* Only reconstruct fixed-size records that match this build. */
-                goto next;
-            }
-            hex = json_get_string(line, "rec_hex");
-            buf = decode_hex(hex, (size_t)exp_size, &len);
-        }
-
-        if(!buf || len != (size_t)exp_size)
-        {
-            free(buf);
-            goto next;
-        }
-
+        /* Register the file name for every event so the record's name is known
+         * even if the file never closes (open-at-exit gap). */
         file = json_get_string(line, "file");
         if(file) add_name_record(name_hash, record_id, file);
         if(rank >= 0 && rank > *max_rank) *max_rank = rank;
-        add_record(records, mod_id, record_id, rank, pid, buf, len, seq, ended_at);
+
+        /* DERIVE counters: fold this per-op event into its record's accumulator.
+         * Only POSIX/STDIO carry a derivable counter set today (matches the modules
+         * whose wrappers stream per-op events with offset/len/timestamps). Every op
+         * of the record's lifetime contributes -- no close snapshot needed, so files
+         * still open at exit get a full record too. */
+        if(mod_id == DARSHAN_POSIX_MOD || mod_id == DARSHAN_STDIO_MOD)
+        {
+            struct acc_record *a = acc_lookup(accs, mod_id, record_id, rank, pid);
+            if(a) acc_update(a, op, offset, len_bytes, started_at, ended_at);
+        }
         (*event_count)++;
 
 next:
         free(module);
         free(file);
-        free(hex);
+        free(op);
     }
 
     free(line);
     fclose(fp);
     return 0;
+}
+
+/* After all events are read, materialize each accumulated record into a native
+ * module struct and hand it to add_record() (records hash). Uses a fixed seq so
+ * the existing dedup treats it as authoritative (there is exactly one per key). */
+static void materialize_acc_records(struct stream_record **records,
+    struct acc_record *accs)
+{
+    struct acc_record *a, *tmp;
+    HASH_ITER(hlink, accs, a, tmp)
+    {
+        int exp_size = expected_record_size(a->key.mod_id);
+        size_t len = 0;
+        void *buf;
+        if(exp_size <= 0) continue;
+        buf = build_record_from_acc(a, (size_t)exp_size, &len);
+        if(!buf) continue;
+        add_record(records, a->key.mod_id, a->key.record_id, a->key.rank,
+                   a->key.pid, buf, len, /*seq*/ ~0ULL, /*ended_at*/ 0.0);
+    }
 }
 
 static void fill_job(struct darshan_job *out, const struct job_info *in,
@@ -985,7 +1168,8 @@ static void fill_job(struct darshan_job *out, const struct job_info *in,
     out->end_time_nsec = (int64_t)((end - floor(end)) * 1000000000.0);
 
     snprintf(out->metadata, sizeof(out->metadata),
-        "lib_ver=unknown\nreconstructor_ver=%s\nreconstructed_from=mofka_jsonl\npartial=true\nhostname=%s\n",
+        "lib_ver=%s\nreconstructor_ver=%s\nreconstructed_from=mofka_jsonl\npartial=true\nhostname=%s\n",
+        darshan_log_get_lib_version(),
         darshan_log_get_lib_version(),
         in->hostname[0] ? in->hostname : "unknown");
 }
@@ -1280,6 +1464,7 @@ int main(int argc, char **argv)
     struct stream_record *records = NULL;
     struct darshan_name_record_ref *name_hash = NULL;   /* global id->name */
     struct job_info *jobs = NULL;                        /* per-pid metadata hash */
+    struct acc_record *accs = NULL;                      /* per-record op accumulator */
     struct job_info *job, *jtmp;
     int64_t max_rank = -1;
     unsigned long long event_count = 0;
@@ -1294,22 +1479,27 @@ int main(int argc, char **argv)
     }
     outdir = argv[2];
 
-    ret = read_events(argv[1], &records, &name_hash, &max_rank, &jobs, &event_count);
+    ret = read_events(argv[1], &records, &name_hash, &max_rank, &jobs,
+        &event_count, &accs);
     if(ret < 0)
         return 1;
 
-    /* Approach A: the stream carries each record's finished counters[]/fcounters[] on
-     * its close event, so `records` is populated with full per-file POSIX/STDIO records
-     * (built in read_events via build_record_from_arrays). The per-pid heatmap records
-     * (from op/len/started_at/ended_at) are built LATER at build_heatmap_records_for_pid().
-     * Old logs with no counter arrays and no rec_hex yield only heatmap ops; bail only if
-     * there is nothing at all to reconstruct: no module records AND no heatmap ops. */
+    /* DERIVE per-file records: fold the accumulated per-op counters (built in
+     * read_events via acc_update) into native POSIX/STDIO structs and add them to
+     * `records`. This is what replaces the old close-time counters[] snapshot -- and
+     * because every op contributes, a file still open at exit (no close event) also
+     * gets a full record. The per-pid heatmap records (from op/len/started_at/
+     * ended_at) are built LATER at build_heatmap_records_for_pid(). Bail only if there
+     * is nothing at all to reconstruct: no module records AND no heatmap ops. */
+    materialize_acc_records(&records, accs);
+
     if(HASH_CNT(hlink, records) == 0 && g_hm_n == 0)
     {
         fprintf(stderr, "Error: no reconstructable records or heatmap ops found in %s\n", argv[1]);
         free_records(records);
         free_namehash(name_hash);
         free_jobs(jobs);
+        free_accs(accs);
         return 1;
     }
 
@@ -1320,6 +1510,7 @@ int main(int argc, char **argv)
         free_records(records);
         free_namehash(name_hash);
         free_jobs(jobs);
+        free_accs(accs);
         return 1;
     }
 
@@ -1361,6 +1552,7 @@ int main(int argc, char **argv)
     free_records(records);
     free_namehash(name_hash);
     free_jobs(jobs);
+    free_accs(accs);
     free(g_hm_ops);
     g_hm_ops = NULL; g_hm_n = g_hm_cap = 0;
     return files_fail == 0 ? 0 : 1;
