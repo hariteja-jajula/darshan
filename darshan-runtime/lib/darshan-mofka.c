@@ -34,16 +34,7 @@ static __thread int  g_in_send;
 
 #define MOFKA_MAX_DRAIN 16
 
-/* One slim I/O event, snapshotted on the app thread and drained off it.
- *
- * NOTE: no raw-record snapshot lives here anymore. The connector streams ONLY the
- * slim per-op envelope (module, op, record_id, file, pid, rank, seq, offset, len,
- * started_at, ended_at) for EVERY op. darshan-mofka-reconstruct.c ACCUMULATES the
- * per-file counters[]/fcounters[] from these per-op events, so we no longer take a
- * close-time snapshot of the raw file_rec struct nor append counter arrays. This
- * (a) makes the stream leaner and (b) fixes the "files still open at exit have no
- * close snapshot" gap: counters are derived from the ops we already saw, so a file
- * that never closes still gets a full record. */
+/* One I/O event, snapshotted on the app thread and drained off it. */
 struct mofka_slot {
     uint64_t record_id;
     int64_t  rank, record_count, offset, length, max_byte, rw_switch, flushes;
@@ -53,11 +44,40 @@ struct mofka_slot {
     const char *mod_name;
     const char *data_type;
     char     file_esc[1024];
+    /* Optional full-record counter snapshot, taken ONCE per record at its terminal
+     * op (close). NULL for ordinary per-op events (which stay slim -> heatmap only).
+     * snap_buf holds a heap copy of the live file_rec's raw bytes -- the app-thread
+     * cost is a single ~sizeof(record) memcpy per file; the drain thread decodes it
+     * into "counters":[...],"fcounters":[...] JSON (all the snprintf work stays off
+     * the app critical path). This replaces rec_hex: same information for a rich
+     * reconstruct, but as portable JSON number arrays, and only at close. */
+    void   *snap_buf;
+    size_t  snap_size;
+    int     snap_mod;      /* module id of the snapshot (for counter-count lookup) */
 };
+
+/* counters[]/fcounters[] element counts for a module record, for snapshot decode.
+ * Both this file and darshan-mofka-reconstruct.c derive these from the shared
+ * darshan-*-log-format.h enums, so the array order matches by construction. */
+static void mofka_record_dims(int mod_id, int *nctr, int *nfctr)
+{
+    switch (mod_id) {
+        case DARSHAN_POSIX_MOD: *nctr = POSIX_NUM_INDICES; *nfctr = POSIX_F_NUM_INDICES; break;
+        case DARSHAN_STDIO_MOD: *nctr = STDIO_NUM_INDICES; *nfctr = STDIO_F_NUM_INDICES; break;
+        default:                *nctr = 0;                 *nfctr = 0;                   break;
+    }
+}
+
+static int mofka_mod_id(const char *mod_name)
+{
+    if (mod_name == NULL) return -1;
+    if (strcmp(mod_name, "POSIX") == 0) return DARSHAN_POSIX_MOD;
+    if (strcmp(mod_name, "STDIO") == 0) return DARSHAN_STDIO_MOD;
+    return -1;
+}
 
 static int             g_async;
 static int             g_block;
-static int             g_raw_json;   /* DARSHAN_MOFKA_RAW_JSON: push verbatim, no re-parse/dump */
 static struct mofka_slot *g_ring;
 static size_t          g_qdepth;
 static size_t          g_head, g_tail;
@@ -186,43 +206,82 @@ static void mofka_serialize_and_push(const struct mofka_slot* s)
       started_epoch = (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
       ended_epoch   = (double)te.tv_sec + (double)te.tv_nsec / 1e9; }
 
-    /* SLIM TELEMETRY ENVELOPE: module, op, record_id, file, pid, rank, seq, offset,
-     * len, started_at, ended_at -- emitted for EVERY op. The reconstructor derives the
-     * full per-file counters[]/fcounters[] by ACCUMULATING these per-op events (counts,
-     * bytes, max byte, access-size histogram, cumulative/max timers, timestamps, rw
-     * switches), so no close-time raw-record snapshot or counter arrays are streamed.
-     * offset+len feed POSIX_MAX_BYTE_* and consec/seq detection; started_at/ended_at
-     * feed the timers and the heatmap. The native .darshan log stays the byte-exact
-     * source of truth.
+    /* SLIM TELEMETRY ENVELOPE: module, op, record_id, file, pid, rank, seq, len,
+     * started_at, ended_at -- the fields darshan-mofka-reconstruct.c's heatmap path
+     * reads (op/len/started_at/ended_at) plus identity (module/record_id/file/pid/
+     * rank/seq). Emitted for EVERY op.
      *
-     * Note the envelope is written WITHOUT its closing brace so the object can be
-     * closed uniformly below. */
+     * When a record snapshot is attached (s->snap_buf, taken once at close), the
+     * full per-file counters[]/fcounters[] arrays are appended as JSON numbers so the
+     * reconstructor can rebuild a near-native per-process record (access sizes, I/O
+     * cost, counts, timers). This REPLACES the old rec_hex field: same information,
+     * but portable JSON number arrays instead of a raw-struct hex dump, and only ONCE
+     * per file (at close) instead of on every event. The native .darshan log stays the
+     * byte-exact source of truth; the stream now also carries enough for a rich report.
+     *
+     * Note the envelope is written WITHOUT its closing brace so the arrays (if any)
+     * can be appended before we close it. */
     n = snprintf(buf, sizeof(buf),
         MOFKA_ENV_HEAD
         MOFKA_ENV_SCHEMA
         "\"module\":\"%s\",\"op\":\"%s\","
         "\"record_id\":\"%016llx\",\"file\":\"%s\",\"pid\":%ld,"
         "\"rank\":%lld,\"seq\":%llu,"
-        "\"offset\":%lld,\"len\":%lld,\"started_at\":%.6f,\"ended_at\":%.6f",
+        "\"len\":%lld,\"started_at\":%.6f,\"ended_at\":%.6f",
         s->mod_name ? s->mod_name : "?",
         s->rwo ? s->rwo : "?",
         (unsigned long long)s->record_id, s->file_esc, g_pid,
         (long long)(g_launcher_rank >= 0 ? g_launcher_rank : s->rank), s->seq,
-        (long long)s->offset, (long long)s->length, started_epoch, ended_epoch);
+        (long long)s->length, started_epoch, ended_epoch);
 
     if (n < 0 || (size_t)n >= sizeof(buf)) return;
+
+    /* Append the full-record counter snapshot as JSON number arrays (drain thread:
+     * all the snprintf cost stays off the app critical path). enum order == array
+     * index on both ends (shared darshan-*-log-format.h). */
+    if (s->snap_buf) {
+        int nctr = 0, nfctr = 0, i;
+        mofka_record_dims(s->snap_mod, &nctr, &nfctr);
+        if (nctr > 0 &&
+            s->snap_size >= sizeof(struct darshan_base_record)
+                            + (size_t)nctr * sizeof(int64_t)
+                            + (size_t)nfctr * sizeof(double)) {
+            const char *base = (const char*)s->snap_buf
+                             + sizeof(struct darshan_base_record);
+            const int64_t *ctr  = (const int64_t*)base;
+            const double  *fctr = (const double*)(base + (size_t)nctr * sizeof(int64_t));
+            int m = snprintf(buf + n, sizeof(buf) - (size_t)n, ",\"counters\":[");
+            if (m < 0 || (size_t)(n + m) >= sizeof(buf)) return;
+            n += m;
+            for (i = 0; i < nctr; i++) {
+                m = snprintf(buf + n, sizeof(buf) - (size_t)n, "%s%lld",
+                             i ? "," : "", (long long)ctr[i]);
+                if (m < 0 || (size_t)(n + m) >= sizeof(buf)) return;
+                n += m;
+            }
+            m = snprintf(buf + n, sizeof(buf) - (size_t)n, "],\"fcounters\":[");
+            if (m < 0 || (size_t)(n + m) >= sizeof(buf)) return;
+            n += m;
+            for (i = 0; i < nfctr; i++) {
+                m = snprintf(buf + n, sizeof(buf) - (size_t)n, "%s%.6f",
+                             i ? "," : "", fctr[i]);
+                if (m < 0 || (size_t)(n + m) >= sizeof(buf)) return;
+                n += m;
+            }
+            m = snprintf(buf + n, sizeof(buf) - (size_t)n, "]");
+            if (m < 0 || (size_t)(n + m) >= sizeof(buf)) return;
+            n += m;
+        }
+    }
 
     /* close the JSON object */
     if ((size_t)n + 1 >= sizeof(buf)) return;
     buf[n++] = '}';
     buf[n]   = '\0';
 
-    /* the real push; in async mode this runs on the drain thread, not in send().
-     * raw path (DARSHAN_MOFKA_RAW_JSON) carries the JSON verbatim to the "raw"
-     * serializer, skipping diaspora's parse+dump round-trip. */
+    /* the real push; in async mode this runs on the drain thread, not in send() */
     double pt0 = darshan_core_wtime();
-    if ((g_raw_json ? diaspora_producer_push_raw : diaspora_producer_push)(
-                g_producer, buf, NULL, 0) != DIASPORA_C_OK)
+    if (diaspora_producer_push(g_producer, buf, NULL, 0) != DIASPORA_C_OK)
         darshan_core_fprintf(stderr, "darshan-mofka: push failed (%s)\n",
                 diaspora_c_last_error());
     mofka_took("push", pt0);
@@ -246,6 +305,8 @@ static void* mofka_drain_main(void* arg)
         pthread_cond_signal(&g_notfull);
         pthread_mutex_unlock(&g_qmtx);
         mofka_serialize_and_push(&local);
+        /* the dequeued copy owns the snapshot heap buffer (if any) */
+        free(local.snap_buf);
     }
     return NULL;
 }
@@ -380,14 +441,6 @@ void darshan_mofka_connector_initialize(struct darshan_core_runtime* init_core)
                 "(batch_size=%zu max_num_batches=%zu)\n",
                 topic_name, batch_size, max_batches);
 
-    /* raw-json handoff: push verbatim JSON text (Metadata parse=false) to the
-     * "raw" serializer, skipping diaspora's parse+dump round-trip. Off by default
-     * so an unset knob is byte-identical to the classic path. Set regardless of
-     * async mode -- both the drain-thread and the sync fallback push honor it. */
-    g_raw_json = 0;
-    { const char* r = getenv("DARSHAN_MOFKA_RAW_JSON");
-      if (r && *r && *r != '0') g_raw_json = 1; }
-
     g_async = 1;
     { const char* a = getenv("DARSHAN_MOFKA_ASYNC");
       if (a && a[0] == '0') g_async = 0; }
@@ -449,11 +502,9 @@ void darshan_mofka_connector_send(uint64_t record_id, int64_t rank,
     const char* file_path;
     size_t next;
     double t0;
-
-    /* rec/rec_size are retained in the signature for ABI stability with the module
-     * wrappers, but are NO LONGER USED: the reconstructor derives per-file counters
-     * by accumulating the slim per-op events instead of decoding a close snapshot. */
-    (void)rec; (void)rec_size;
+    int    snap_mod = -1;
+    void  *snap_buf = NULL;
+    size_t snap_size = 0;
 
     if (g_producer == NULL || g_in_send) return;
     g_in_send = 1;
@@ -464,6 +515,22 @@ void darshan_mofka_connector_send(uint64_t record_id, int64_t rank,
     seq = (unsigned long long)atomic_fetch_add(&g_seq, 1);
     file_path = (const char*)darshan_core_lookup_record_name(record_id);
 
+    /* rec_hex is gone, but we still recover a near-native pydarshan report by
+     * snapshotting the full counter arrays ONCE per record, at its close op. The
+     * reconstructor's max-seq dedup makes the close snapshot (highest seq) win, so
+     * the per-op events stay slim (heatmap) and exactly one fat event carries the
+     * final counters[]/fcounters[] for that file. */
+    if (rec != NULL && rec_size > 0 && rwo != NULL && strcmp(rwo, "close") == 0) {
+        int mid = mofka_mod_id(mod_name);
+        if (mid >= 0) {
+            void* cp = malloc(rec_size);
+            if (cp != NULL) {
+                memcpy(cp, rec, rec_size);
+                snap_buf = cp; snap_size = rec_size; snap_mod = mid;
+            }
+        }
+    }
+
     if (!g_async) {
 
         struct mofka_slot ss;
@@ -473,8 +540,10 @@ void darshan_mofka_connector_send(uint64_t record_id, int64_t rank,
         ss.rw_switch=rw_switch; ss.flushes=flushes;
         ss.start_time=start_time; ss.end_time=end_time; ss.total_time=total_time;
         ss.seq=seq; ss.rwo=rwo; ss.mod_name=mod_name; ss.data_type=data_type;
+        ss.snap_buf=snap_buf; ss.snap_size=snap_size; ss.snap_mod=snap_mod;
         json_escape_into(ss.file_esc, sizeof(ss.file_esc), file_path);
         mofka_serialize_and_push(&ss);
+        free(snap_buf);   /* no drain thread in sync mode; free our own snapshot */
         goto out;
     }
 
@@ -488,6 +557,7 @@ void darshan_mofka_connector_send(uint64_t record_id, int64_t rank,
         if (next == g_tail) {
             pthread_mutex_unlock(&g_qmtx);
             atomic_fetch_add(&g_dropped, 1);
+            free(snap_buf);   /* dropped event: drain thread never sees it, free here */
             goto out;
         }
     }
@@ -497,6 +567,7 @@ void darshan_mofka_connector_send(uint64_t record_id, int64_t rank,
     s->rw_switch=rw_switch; s->flushes=flushes;
     s->start_time=start_time; s->end_time=end_time; s->total_time=total_time;
     s->seq=seq; s->rwo=rwo; s->mod_name=mod_name; s->data_type=data_type;
+    s->snap_buf=snap_buf; s->snap_size=snap_size; s->snap_mod=snap_mod;
     json_escape_into(s->file_esc, sizeof(s->file_esc), file_path);
     g_head = next;
     pthread_cond_signal(&g_notempty);
