@@ -22,7 +22,6 @@
 #ifdef HAVE_MOFKA
 
 #include <stdatomic.h>
-#include <pthread.h>
 #include <diaspora/diaspora_c.h>
 
 static diaspora_driver_t*   g_driver;
@@ -32,9 +31,15 @@ static diaspora_producer_t* g_producer;
 static atomic_ullong g_seq;
 static __thread int  g_in_send;
 
-#define MOFKA_MAX_DRAIN 16
+/* Aggregate producer-push timing (the ONE number Phase 1 reports at finalize):
+ * summed wall-clock ns spent inside diaspora_producer_push() and the push count.
+ * Only accumulated when DARSHAN_MOFKA_TIMING is set, so the production hot path
+ * pays nothing. */
+static atomic_ullong g_push_ns;
+static atomic_ullong g_push_n;
 
-/* One I/O event, snapshotted on the app thread and drained off it. */
+/* Field bundle for one I/O event, filled on the app thread and passed straight to
+ * mofka_serialize_and_push() -> diaspora_producer_push() (no ring, no drain thread). */
 struct mofka_slot {
     uint64_t record_id;
     int64_t  rank, record_count, offset, length, max_byte, rw_switch, flushes;
@@ -65,20 +70,6 @@ static int mofka_mod_id(const char *mod_name)
     if (strcmp(mod_name, "STDIO") == 0) return DARSHAN_STDIO_MOD;
     return -1;
 }
-
-static int             g_async;
-static int             g_block;
-static struct mofka_slot *g_ring;
-static size_t          g_qdepth;
-static size_t          g_head, g_tail;
-static pthread_mutex_t g_qmtx     = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t  g_notempty = PTHREAD_COND_INITIALIZER;
-static pthread_cond_t  g_notfull  = PTHREAD_COND_INITIALIZER;
-static pthread_t       g_drain[MOFKA_MAX_DRAIN];
-static int             g_ndrain;
-static volatile int    g_stop;
-static int             g_leak_ring;
-static atomic_ullong   g_dropped;
 
 static char    g_hostname[256];
 static long    g_pid;
@@ -167,20 +158,8 @@ static void mofka_emit_metadata_once(void)
 }
 
 /* ------------------------------------------------------------------ *
- *  Ring buffer + drain thread (the hot path lives here)              *
+ *  Direct push (the entire hot path -- no ring, no drain thread)      *
  * ------------------------------------------------------------------ */
-
-
-static void mofka_atfork_prepare(void) { pthread_mutex_lock(&g_qmtx); }
-static void mofka_atfork_parent(void)  { pthread_mutex_unlock(&g_qmtx); }
-static void mofka_atfork_child(void)
-{
-    pthread_mutex_init(&g_qmtx, NULL);
-    pthread_cond_init(&g_notempty, NULL);
-    pthread_cond_init(&g_notfull, NULL);
-    g_ring = NULL; g_async = 0; g_ndrain = 0;
-    g_head = g_tail = 0; g_producer = NULL; g_topic = NULL; g_driver = NULL;
-}
 
 /* Build the JSON envelope from a snapshot and push it (all the CPU cost). */
 static void mofka_serialize_and_push(const struct mofka_slot* s)
@@ -250,43 +229,34 @@ static void mofka_serialize_and_push(const struct mofka_slot* s)
     buf[n++] = '}';
     buf[n]   = '\0';
 
-    /* the real push; in async mode this runs on the drain thread, not in send() */
-    double pt0 = darshan_core_wtime();
-    if (diaspora_producer_push(g_producer, buf, NULL, 0) != DIASPORA_C_OK)
+    /* Direct push -- the entire cost of the connector's hot path is on this one
+     * line. diaspora_producer_push() is made ABT-safe from this raw app thread by
+     * forcing DIASPORA_C_SENDER_THREADS>=1 at init, so the enqueue runs as a
+     * self-contained ULT on a dedicated sender ES (it copies buf internally).
+     * When timing is enabled we bracket ONLY the push and fold it into the
+     * aggregate accumulators reported once at finalize; otherwise the production
+     * hot path pays nothing for measurement. */
+    if (g_timing) {
+        double pt0 = darshan_core_wtime();
+        int rc = diaspora_producer_push(g_producer, buf, NULL, 0);
+        atomic_fetch_add(&g_push_ns,
+            (unsigned long long)((darshan_core_wtime() - pt0) * 1e9));
+        atomic_fetch_add(&g_push_n, 1);
+        if (rc != DIASPORA_C_OK)
+            darshan_core_fprintf(stderr, "darshan-mofka: push failed (%s)\n",
+                    diaspora_c_last_error());
+    } else if (diaspora_producer_push(g_producer, buf, NULL, 0) != DIASPORA_C_OK) {
         darshan_core_fprintf(stderr, "darshan-mofka: push failed (%s)\n",
                 diaspora_c_last_error());
-    mofka_took("push", pt0);
-}
-
-/* Drain thread: pop snapshots off the ring and serialize+push them. */
-static void* mofka_drain_main(void* arg)
-{
-    struct mofka_slot local;
-    (void)arg;
-
-    g_in_send = 1;
-    mofka_emit_metadata_once();
-    for (;;) {
-        pthread_mutex_lock(&g_qmtx);
-        while (g_head == g_tail && !g_stop)
-            pthread_cond_wait(&g_notempty, &g_qmtx);
-        if (g_head == g_tail && g_stop) { pthread_mutex_unlock(&g_qmtx); break; }
-        local = g_ring[g_tail];
-        g_tail = (g_tail + 1) % g_qdepth;
-        pthread_cond_signal(&g_notfull);
-        pthread_mutex_unlock(&g_qmtx);
-        mofka_serialize_and_push(&local);
-        /* the dequeued copy owns the snapshot heap buffer (if any) */
-        free(local.snap_buf);
     }
-    return NULL;
 }
 
 /* ------------------------------------------------------------------ *
  *  Lifecycle: initialize -> send -> flush_records -> finalize        *
  * ------------------------------------------------------------------ */
 
-/* Connect the producer and, unless ASYNC=0, start the ring + drain thread(s). */
+/* Connect the producer. The hot path pushes directly from the app thread; a
+ * dedicated Diaspora sender ES (forced on below) makes that push ABT-safe. */
 void darshan_mofka_connector_initialize(struct darshan_core_runtime* init_core)
 {
     const char* group_file;
@@ -385,6 +355,16 @@ void darshan_mofka_connector_initialize(struct darshan_core_runtime* init_core)
         return;
     }
 
+    /* Force a dedicated Diaspora sender xstream (>=1) BEFORE creating the producer.
+     * diaspora_producer_create reads DIASPORA_C_SENDER_THREADS: with 0 (the default)
+     * the sender runs on Mofka's progress pool and push() takes an Argobots mutex
+     * directly on THIS raw pthread -- unsafe, it can wedge the margo scheduler. With
+     * >=1 it builds an Argobots ThreadPool, sets abt_safe_push, and routes push
+     * through pool.pushWork() (a self-contained ULT that copies our buffer), which is
+     * safe to call from the app thread. We only set it if the user has not, so an
+     * explicit override still wins. */
+    setenv("DIASPORA_C_SENDER_THREADS", "1", 0);
+
     snprintf(pname, sizeof(pname), "darshan-%ld", g_pid);
     g_producer = diaspora_producer_create(g_topic, pname, batch_size, max_batches,
                                           DIASPORA_C_ORDERING_LOOSE);
@@ -398,55 +378,15 @@ void darshan_mofka_connector_initialize(struct darshan_core_runtime* init_core)
 
     if (getenv("DARSHAN_MOFKA_VERBOSE"))
         darshan_core_fprintf(stderr, "darshan-mofka: producer connected to topic '%s' "
-                "(batch_size=%zu max_num_batches=%zu)\n",
+                "(batch_size=%zu max_num_batches=%zu, direct push)\n",
                 topic_name, batch_size, max_batches);
-
-    g_async = 1;
-    { const char* a = getenv("DARSHAN_MOFKA_ASYNC");
-      if (a && a[0] == '0') g_async = 0; }
-    if (g_async) {
-        const char* e;
-        g_qdepth = 65536;
-        if ((e = getenv("DARSHAN_MOFKA_QUEUE_DEPTH")) && *e) {
-            size_t q = (size_t)strtoull(e, NULL, 10);
-            if (q >= 2) g_qdepth = q;
-        }
-        g_block = 0;
-        if ((e = getenv("DARSHAN_MOFKA_DROP_POLICY")) && strcmp(e, "block") == 0) g_block = 1;
-        g_ndrain = 1;
-        if ((e = getenv("DARSHAN_MOFKA_DRAIN_THREADS")) && *e) {
-            int nd = (int)strtol(e, NULL, 10);
-            if (nd >= 1 && nd <= MOFKA_MAX_DRAIN) g_ndrain = nd;
-        }
-        g_stop = 0; g_head = g_tail = 0;
-        g_ring = calloc(g_qdepth, sizeof(*g_ring));
-        if (g_ring == NULL) {
-            darshan_core_fprintf(stderr, "darshan-mofka: ring calloc(%zu) failed; "
-                    "falling back to synchronous push.\n", g_qdepth);
-            g_async = 0;
-        } else {
-            int started = 0, i;
-            for (i = 0; i < g_ndrain; i++)
-                if (pthread_create(&g_drain[i], NULL, mofka_drain_main, NULL) == 0) started++;
-            g_ndrain = started;
-            if (started == 0) {
-                darshan_core_fprintf(stderr, "darshan-mofka: no drain thread started; "
-                        "falling back to synchronous push.\n");
-                free(g_ring); g_ring = NULL; g_async = 0;
-            } else {
-                pthread_atfork(mofka_atfork_prepare, mofka_atfork_parent, mofka_atfork_child);
-                if (getenv("DARSHAN_MOFKA_VERBOSE"))
-                    darshan_core_fprintf(stderr, "darshan-mofka: async ON "
-                            "(qdepth=%zu drain_threads=%d drop_policy=%s)\n",
-                            g_qdepth, g_ndrain, g_block ? "block" : "drop");
-            }
-        }
-    }
 
     mofka_took("initialize", t0);
 }
 
-/* Hot path: assign seq, snapshot the op into the ring (sync mode pushes inline). */
+/* Hot path: assign seq, snapshot the op, build the envelope, push it directly.
+ * No ring, no drain thread -- the push goes straight to the Diaspora producer
+ * (whose own dedicated sender ES does the transport). */
 void darshan_mofka_connector_send(uint64_t record_id, int64_t rank,
                                   int64_t record_count, char* rwo,
                                   int64_t offset, int64_t length,
@@ -457,20 +397,16 @@ void darshan_mofka_connector_send(uint64_t record_id, int64_t rank,
                                   char* mod_name, char* data_type,
                                   const void* rec, uint64_t rec_size)
 {
-    struct mofka_slot* s;
-    unsigned long long seq;
+    struct mofka_slot ss;
     const char* file_path;
-    size_t next;
     double t0;
-    int    snap_mod = -1;
-    void  *snap_buf = NULL;
-    size_t snap_size = 0;
 
     if (g_producer == NULL || g_in_send) return;
     g_in_send = 1;
     t0 = darshan_core_wtime();
 
-    seq = (unsigned long long)atomic_fetch_add(&g_seq, 1);
+    ss.snap_buf = NULL; ss.snap_size = 0; ss.snap_mod = -1;
+    ss.seq = (unsigned long long)atomic_fetch_add(&g_seq, 1);
     file_path = (const char*)darshan_core_lookup_record_name(record_id);
 
     if (rec != NULL && rec_size > 0 && rwo != NULL && strcmp(rwo, "close") == 0) {
@@ -479,54 +415,21 @@ void darshan_mofka_connector_send(uint64_t record_id, int64_t rank,
             void* cp = malloc(rec_size);
             if (cp != NULL) {
                 memcpy(cp, rec, rec_size);
-                snap_buf = cp; snap_size = rec_size; snap_mod = mid;
+                ss.snap_buf = cp; ss.snap_size = rec_size; ss.snap_mod = mid;
             }
         }
     }
 
-    if (!g_async) {
+    mofka_emit_metadata_once();
+    ss.record_id=record_id; ss.rank=rank; ss.record_count=record_count;
+    ss.offset=offset; ss.length=length; ss.max_byte=max_byte;
+    ss.rw_switch=rw_switch; ss.flushes=flushes;
+    ss.start_time=start_time; ss.end_time=end_time; ss.total_time=total_time;
+    ss.rwo=rwo; ss.mod_name=mod_name; ss.data_type=data_type;
+    json_escape_into(ss.file_esc, sizeof(ss.file_esc), file_path);
+    mofka_serialize_and_push(&ss);
+    free(ss.snap_buf);   /* we own the snapshot; push copied what it needed */
 
-        struct mofka_slot ss;
-        mofka_emit_metadata_once();
-        ss.record_id=record_id; ss.rank=rank; ss.record_count=record_count;
-        ss.offset=offset; ss.length=length; ss.max_byte=max_byte;
-        ss.rw_switch=rw_switch; ss.flushes=flushes;
-        ss.start_time=start_time; ss.end_time=end_time; ss.total_time=total_time;
-        ss.seq=seq; ss.rwo=rwo; ss.mod_name=mod_name; ss.data_type=data_type;
-        ss.snap_buf=snap_buf; ss.snap_size=snap_size; ss.snap_mod=snap_mod;
-        json_escape_into(ss.file_esc, sizeof(ss.file_esc), file_path);
-        mofka_serialize_and_push(&ss);
-        free(snap_buf);   /* no drain thread in sync mode; free our own snapshot */
-        goto out;
-    }
-
-    pthread_mutex_lock(&g_qmtx);
-    next = (g_head + 1) % g_qdepth;
-    if (next == g_tail) {
-        if (g_block) {
-            while (next == g_tail && !g_stop)
-                pthread_cond_wait(&g_notfull, &g_qmtx);
-        }
-        if (next == g_tail) {
-            pthread_mutex_unlock(&g_qmtx);
-            atomic_fetch_add(&g_dropped, 1);
-            free(snap_buf);   /* dropped event: drain thread never sees it, free here */
-            goto out;
-        }
-    }
-    s = &g_ring[g_head];
-    s->record_id=record_id; s->rank=rank; s->record_count=record_count;
-    s->offset=offset; s->length=length; s->max_byte=max_byte;
-    s->rw_switch=rw_switch; s->flushes=flushes;
-    s->start_time=start_time; s->end_time=end_time; s->total_time=total_time;
-    s->seq=seq; s->rwo=rwo; s->mod_name=mod_name; s->data_type=data_type;
-    s->snap_buf=snap_buf; s->snap_size=snap_size; s->snap_mod=snap_mod;
-    json_escape_into(s->file_esc, sizeof(s->file_esc), file_path);
-    g_head = next;
-    pthread_cond_signal(&g_notempty);
-    pthread_mutex_unlock(&g_qmtx);
-
-out:
     mofka_took("send", t0);
     g_in_send = 0;
 }
@@ -567,8 +470,7 @@ void darshan_mofka_connector_flush_records(struct darshan_core_runtime* core)
     }
 }
 
-/* Stop + join the drain thread(s), flush pending batches, tear down the producer.
- * Bounded join: on timeout, leak the producer/ring to avoid a shutdown hang. */
+/* Flush pending batches, report the aggregate push cost, tear down the producer. */
 void darshan_mofka_connector_finalize(void)
 {
     int rc;
@@ -578,36 +480,7 @@ void darshan_mofka_connector_finalize(void)
 
     t0 = darshan_core_wtime();
 
-    if (g_async && g_ndrain > 0) {
-        int i, all_joined = 1;
-        struct timespec ts;
-        pthread_mutex_lock(&g_qmtx);
-        g_stop = 1;
-        pthread_cond_broadcast(&g_notempty);
-        pthread_cond_broadcast(&g_notfull);
-        pthread_mutex_unlock(&g_qmtx);
-        clock_gettime(CLOCK_REALTIME, &ts);
-        { const char* je = getenv("DARSHAN_MOFKA_JOIN_MS");
-          unsigned join_ms = (je && *je) ? (unsigned)strtoul(je, NULL, 10) : 10000;
-          ts.tv_sec  += join_ms / 1000;
-          ts.tv_nsec += (long)(join_ms % 1000) * 1000000L;
-          if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; } }
-        for (i = 0; i < g_ndrain; i++)
-            if (pthread_timedjoin_np(g_drain[i], NULL, &ts) != 0) all_joined = 0;
-        g_async = 0; g_ndrain = 0;
-        if (!all_joined) {
-            darshan_core_fprintf(stderr, "darshan-mofka: drain join timed out; "
-                    "leaking producer to avoid a shutdown hang.\n");
-            g_producer = NULL;
-            g_leak_ring = 1;
-        }
-    }
-
-    { unsigned long long d = atomic_load(&g_dropped);
-      if (d) darshan_core_fprintf(stderr, "darshan-mofka: dropped %llu events (ring full); "
-              "raise DARSHAN_MOFKA_QUEUE_DEPTH or use DARSHAN_MOFKA_DROP_POLICY=block\n", d); }
-
-    if (g_producer) {
+    {
         const char* fe = getenv("DARSHAN_MOFKA_FLUSH_MS");
         unsigned flush_ms = (fe && *fe) ? (unsigned)strtoul(fe, NULL, 10) : 5000;
         rc = diaspora_producer_flush_timeout(g_producer, flush_ms);
@@ -619,12 +492,24 @@ void darshan_mofka_connector_finalize(void)
     }
     mofka_took("finalize", t0);
 
+    /* The ONE Phase-1 number: total wall-clock spent in diaspora_producer_push()
+     * across this rank, the push count, and the mean per push. Only populated when
+     * DARSHAN_MOFKA_TIMING is set (the hot path skips the timer otherwise). */
+    if (g_timing) {
+        unsigned long long tot_ns = atomic_load(&g_push_ns);
+        unsigned long long n      = atomic_load(&g_push_n);
+        double tot_us = (double)tot_ns / 1e3;
+        double avg_us = n ? tot_us / (double)n : 0.0;
+        darshan_core_fprintf(stderr,
+            "darshan-mofka[timing] PUSH_TOTAL pushes=%llu total_push_us=%.1f avg_push_us=%.3f\n",
+            n, tot_us, avg_us);
+    }
+
 clear:
 
     if (g_producer) { diaspora_producer_destroy(g_producer); g_producer = NULL; }
     if (g_topic)    { diaspora_topic_destroy(g_topic);       g_topic = NULL; }
     if (g_driver)   { diaspora_driver_destroy(g_driver);     g_driver = NULL; }
-    if (g_ring && !g_leak_ring) { free(g_ring); g_ring = NULL; }
 }
 
 #else
