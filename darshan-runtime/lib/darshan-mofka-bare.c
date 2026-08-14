@@ -11,7 +11,6 @@
 #define _XOPEN_SOURCE 500
 #define _GNU_SOURCE
 
-#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -27,31 +26,12 @@
 #include <diaspora/diaspora_c.h>
 
 /* -------------------------------------------------------------------------- */
-/* Configuration                                                              */
-/* -------------------------------------------------------------------------- */
-
-#define MOFKA_MAX_PUSH_TIMES 100000
-
-/* -------------------------------------------------------------------------- */
 /* Global Mofka/Diaspora objects                                              */
 /* -------------------------------------------------------------------------- */
 
 static diaspora_driver_t   *g_driver   = NULL;
 static diaspora_topic_t    *g_topic    = NULL;
 static diaspora_producer_t *g_producer = NULL;
-
-/* Timing accumulators */
-static atomic_ullong g_init_ns;
-static atomic_ullong g_push_ns;
-static atomic_ullong g_push_n;
-
-/*
- * Individual push durations.
- *
- * Each send atomically reserves a unique index before storing its duration.
- * Printing happens only at finalize.
- */
-static unsigned long long g_push_times_ns[MOFKA_MAX_PUSH_TIMES];
 
 /* -------------------------------------------------------------------------- */
 /* Initialize                                                                 */
@@ -71,19 +51,8 @@ void darshan_mofka_connector_initialize(
     char opts[4096];
     char producer_name[64];
 
-    double init_t0;
-    double init_elapsed;
-
     (void)init_core;
 
-    /*
-     * Measure complete connector initialization.
-     */
-    init_t0 = darshan_core_wtime();
-
-    /*
-     * Required Mofka group file.
-     */
     group_file = getenv("DARSHAN_MOFKA_GROUP_FILE");
 
     if (group_file == NULL || *group_file == '\0')
@@ -180,16 +149,6 @@ void darshan_mofka_connector_initialize(
 
         return;
     }
-
-    /*
-     * Stop initialization timer only after producer creation succeeds.
-     */
-    init_elapsed =
-        darshan_core_wtime() - init_t0;
-
-    atomic_store(
-        &g_init_ns,
-        (unsigned long long)(init_elapsed * 1e9));
 }
 
 /* -------------------------------------------------------------------------- */
@@ -222,12 +181,6 @@ void darshan_mofka_connector_send(
     double started_epoch;
     double ended_epoch;
 
-    double push_t0;
-    double push_elapsed;
-
-    unsigned long long elapsed_ns;
-    unsigned long long idx;
-
     int n;
 
     (void)record_count;
@@ -244,13 +197,10 @@ void darshan_mofka_connector_send(
         return;
 
     /*
-     * Convert Darshan relative wtime values to absolute timestamps.
+     * Convert Darshan relative timestamps to absolute epoch timestamps.
      */
-    ts =
-        darshan_core_abs_timespec_from_wtime(start_time);
-
-    te =
-        darshan_core_abs_timespec_from_wtime(end_time);
+    ts = darshan_core_abs_timespec_from_wtime(start_time);
+    te = darshan_core_abs_timespec_from_wtime(end_time);
 
     started_epoch =
         (double)ts.tv_sec +
@@ -287,50 +237,12 @@ void darshan_mofka_connector_send(
     if (n < 0 || (size_t)n >= sizeof(buf))
         return;
 
-    /*
-     * Measure ONLY diaspora_producer_push().
-     */
-    push_t0 =
-        darshan_core_wtime();
 
     diaspora_producer_push(
         g_producer,
         buf,
         NULL,
         0);
-
-    push_elapsed =
-        darshan_core_wtime() - push_t0;
-
-    elapsed_ns =
-        (unsigned long long)(push_elapsed * 1e9);
-
-    /*
-     * Reserve a unique index and increment total push count.
-     */
-    idx =
-        atomic_fetch_add(
-            &g_push_n,
-            1);
-
-    /*
-     * Store individual timing if space is available.
-     *
-     * This happens after the second timer call, so it is not included
-     * in the measured diaspora_producer_push() duration.
-     */
-    if (idx < MOFKA_MAX_PUSH_TIMES)
-    {
-        g_push_times_ns[idx] =
-            elapsed_ns;
-    }
-
-    /*
-     * Maintain aggregate push time.
-     */
-    atomic_fetch_add(
-        &g_push_ns,
-        elapsed_ns);
 }
 
 /* -------------------------------------------------------------------------- */
@@ -339,104 +251,13 @@ void darshan_mofka_connector_send(
 
 void darshan_mofka_connector_finalize(void)
 {
-    unsigned long long init_ns;
-    unsigned long long push_ns;
-    unsigned long long pushes;
-    unsigned long long stored_pushes;
-    unsigned long long i;
-
-    double init_us;
-    double push_total_us;
-    double push_avg_us;
-
-    /*
-     * Flush outstanding producer events before destroying Mofka objects.
-     */
     if (g_producer != NULL)
     {
+
         diaspora_producer_flush_timeout(
             g_producer,
             5000);
-    }
 
-    /*
-     * Load aggregate timing measurements.
-     */
-    init_ns =
-        atomic_load(&g_init_ns);
-
-    push_ns =
-        atomic_load(&g_push_ns);
-
-    pushes =
-        atomic_load(&g_push_n);
-
-    init_us =
-        (double)init_ns / 1e3;
-
-    push_total_us =
-        (double)push_ns / 1e3;
-
-    push_avg_us =
-        pushes
-            ? push_total_us / (double)pushes
-            : 0.0;
-
-    /*
-     * Print aggregate timing.
-     */
-    darshan_core_fprintf(
-        stderr,
-        "darshan-mofka TIMING "
-        "init_us=%.3f "
-        "pushes=%llu "
-        "push_total_us=%.3f "
-        "push_avg_us=%.3f\n",
-        init_us,
-        pushes,
-        push_total_us,
-        push_avg_us);
-
-    /*
-     * Print individual push timings.
-     *
-     * These were collected in memory during execution, so this printing
-     * does not affect the measured duration of each push.
-     */
-    stored_pushes =
-        pushes < MOFKA_MAX_PUSH_TIMES
-            ? pushes
-            : MOFKA_MAX_PUSH_TIMES;
-
-    for (i = 0; i < stored_pushes; i++)
-    {
-        darshan_core_fprintf(
-            stderr,
-            "darshan-mofka PUSH "
-            "index=%llu "
-            "push_us=%.3f\n",
-            i,
-            (double)g_push_times_ns[i] / 1e3);
-    }
-
-    /*
-     * Warn if more pushes occurred than we had storage for.
-     */
-    if (pushes > MOFKA_MAX_PUSH_TIMES)
-    {
-        darshan_core_fprintf(
-            stderr,
-            "darshan-mofka: WARNING "
-            "pushes=%llu but only first %d individual timings stored\n",
-            pushes,
-            MOFKA_MAX_PUSH_TIMES);
-    }
-
-    /*
-     * Destroy Mofka objects.
-     */
-    if (g_producer != NULL)
-    {
         diaspora_producer_destroy(g_producer);
         g_producer = NULL;
     }

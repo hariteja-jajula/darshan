@@ -354,8 +354,11 @@ void darshan_core_initialize(int argc, char **argv)
 #endif
 
 #ifdef HAVE_MOFKA
-        if (getenv("DARSHAN_MOFKA_ENABLE"))
-            darshan_mofka_connector_initialize(init_core);
+        {
+            const char *mofka_enable = getenv("DARSHAN_MOFKA_ENABLE");
+            if (mofka_enable && *mofka_enable && strcmp(mofka_enable, "0") != 0)
+                darshan_mofka_connector_initialize(init_core);
+        }
 #endif
 
         /* if darshan was successfully initialized, set the global pointer
@@ -766,12 +769,9 @@ void darshan_core_shutdown(int write_log)
     }
 
 cleanup:
-#ifdef HAVE_MOFKA
-    /* stream every module record's FINAL state BEFORE the buffers are freed below, so records
-     * whose ops were never streamed live (e.g. python interpreter-startup files opened during the
-     * producer-init window) still land. No-op unless DARSHAN_MOFKA_FINAL_SWEEP is set. */
-    darshan_mofka_connector_flush_records(final_core);
-#endif
+// #ifdef HAVE_MOFKA
+//     darshan_mofka_connector_flush_records(final_core);
+// #endif
     for(i = 0; i < DARSHAN_KNOWN_MODULE_COUNT; i++)
         if(final_core->mod_array[i])
             final_core->mod_array[i]->mod_funcs.mod_cleanup_func();
